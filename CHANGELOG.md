@@ -42,14 +42,25 @@ version number is not a stability promise until 1.0; read the entry.
   built ESM Electron main bundle leaves packages external, and Node refuses a
   named import from a CJS package with getter-defined exports. CJS is carried
   too, for everyone else.
-- **The POSIX backend is written but has not yet RUN anywhere.**
-  `posix_openpt` / `grantpt` / `unlockpt` / `ptsname`, then
-  `fork` + `setsid` + `ioctl(TIOCSCTTY)` + `dup2` + `execvp`, with a CLOEXEC
-  errno pipe so a failed exec is reported rather than appearing as a shell that
-  exited 127. It typechecks for `x86_64-unknown-linux-gnu` and
-  `aarch64-apple-darwin`, and CI's live jobs on `linux-x64`, `linux-arm64` and
-  `darwin-arm64` are its first real exercise. Until one of those is green it is
-  unproven — "it compiles" is not "it works".
+- **The POSIX backend** — `posix_openpt` / `grantpt` / `unlockpt` / `ptsname`,
+  then `fork` + `setsid` + `ioctl(TIOCSCTTY)` + `dup2` + `execvp`, with a
+  CLOEXEC errno pipe so a failed exec is reported rather than appearing as a
+  shell that exited 127. Verified by the live suite on real CI runners:
+
+  | platform | per pty | retained / exited pty |
+  |---|---|---|
+  | `win32-x64` | 34 ms | 0.008 MB, 0.000 handles |
+  | `linux-x64` | 3 ms | 0.027 MB, 0.000 handles |
+  | `linux-arm64` | 3 ms | 0.031 MB, 0.000 handles |
+  | `darwin-arm64` | 10 ms | 0.046 MB, 0.000 handles |
+
+  `darwin-x64` and `win32-arm64` cross-compile clean but have not run — nothing
+  in CI hosts them natively, and "builds" is not "works".
+- `npm run lint` typechecks the helper for **all six** targets, not just the
+  host. `c_char` is unsigned on `aarch64-linux` and signed elsewhere, so
+  hardcoded `i8` C-string pointers compiled on four targets and failed on one;
+  a `cfg`-heavy file is only as checked as the targets you compiled it for, and
+  the arms you did not compile are unparsed rather than merely untested.
 
 <!--
 Nothing has been released yet. The first publish needs the npm name to exist,

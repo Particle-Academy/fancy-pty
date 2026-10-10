@@ -153,13 +153,26 @@ any machine — so the macOS CI job is where that arm is proven.
 
 ## Status
 
-**Windows works end to end**, verified locally: real shells, resize, kill, zero
-orphans, and the leak bar at 0.009 MB / 0.000 handles per exited pty.
+**Working on four platforms, measured in CI on real runners** — 60 spawn/exit
+cycles each, every one against the live suite (real shell, the execution oracle,
+size reported back, resize, kill, failed spawn, orphan sweep), and each opening
+with the positive control that proves the gauges move at all (20 live ptys:
+libuv handles 12 -> 92 everywhere).
 
-**POSIX is written and typechecks for `linux-x64` and `aarch64-apple-darwin`,
-but has not yet RUN anywhere.** CI is the first exercise of it — the live suite
-is enabled on `linux-x64`, `linux-arm64` and `darwin-arm64`. Until one of those
-jobs is green, treat the POSIX backend as unproven, and say so rather than
-rounding "it compiles" up to "it works".
+| platform | per pty | retained / exited pty |
+|---|---|---|
+| `win32-x64` | 34 ms | 0.008 MB, 0.000 handles |
+| `linux-x64` | 3 ms | 0.027 MB, 0.000 handles |
+| `linux-arm64` | 3 ms | 0.031 MB, 0.000 handles |
+| `darwin-arm64` | 10 ms | 0.046 MB, 0.000 handles |
 
-Nothing has been published; the npm name does not exist yet.
+The bar is <= 0.5 MB and <= 1.0 handles per exited pty. The worst platform is
+**11x under** the memory threshold and **zero** on handles, against an incident
+that retained ~12 MB and ~11 handles per exited pty.
+
+`darwin-x64` and `win32-arm64` are cross-compiled and build clean, but have not
+run — nothing in CI hosts them natively. Say "builds, unproven" for those two
+rather than rounding four green platforms up to six.
+
+Nothing has been published; the npm name does not exist yet, and the first
+publish is the one-time authenticated step only the owner can perform.

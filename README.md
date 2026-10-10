@@ -92,6 +92,18 @@ Helpers ship for `win32`, `darwin` and `linux` on both `x64` and `arm64`.
 Windows uses ConPTY; macOS and Linux use `posix_openpt` with
 `fork`/`setsid`/`TIOCSCTTY`.
 
+Measured in CI on real runners, 60 spawn/exit cycles per platform:
+
+| platform | per pty | retained / exited pty |
+|---|---|---|
+| `win32-x64` | 34 ms | 0.008 MB, 0.000 handles |
+| `linux-x64` | 3 ms | 0.027 MB, 0.000 handles |
+| `linux-arm64` | 3 ms | 0.031 MB, 0.000 handles |
+| `darwin-arm64` | 10 ms | 0.046 MB, 0.000 handles |
+
+Against a bar of <= 0.5 MB and <= 1.0 handles per exited pty. `darwin-x64` and
+`win32-arm64` cross-compile clean but have not run natively anywhere.
+
 This is **not** a terminal emulator. It moves bytes and owns process lifetime;
 rendering belongs to [`fancy-term`](https://github.com/Particle-Academy/fancy-term).
 
