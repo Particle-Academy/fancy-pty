@@ -448,3 +448,128 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
         Ok(code as u32)
     }
 }
+
+// ============================================================ ioctl PROBE
+//
+// `--probe-pty`. Exists because macOS CI returned ENOTTY from
+// `ioctl(master, TIOCSWINSZ)` and there are two credible causes, which no
+// amount of reading can separate:
+//
+//   A. THE VARIADIC ABI. On AArch64 Apple, a variadic function's variadic
+//      arguments are passed on the STACK, not in registers. If Rust's variadic
+//      `extern "C"` declaration and libc's `va_arg` disagree, the request or
+//      the pointer arrives mangled -- and a mangled request number produces
+//      exactly ENOTTY, because the kernel simply does not recognise it.
+//
+//   B. ORDERING. The master may not accept terminal ioctls until the SLAVE
+//      side has been opened, since that is what attaches the tty state. Linux
+//      plainly does not require this; BSD might.
+//
+// So the probe tests each one, and reports instead of concluding. This is the
+// same move that settled the Windows child-stdio question in one run after a
+// confident wrong theory: when a diagnosis stalls, stop reasoning about the
+// subject and get it to REPORT. `cmd.exe` reported failure by doing nothing,
+// and so does an ioctl that only ever returns -1.
+//
+// It runs on LINUX too, deliberately. The Linux constants are known-good
+// (read off the system headers), so Linux output is the positive control: if
+// the probe says "A fails" there as well, the probe is broken, not the ioctl.
+
+// Two declarations of one symbol with different signatures is exactly what is
+// being tested, so the warning is the mechanism rather than a mistake. Scoped
+// to this block so it cannot hide a real clash elsewhere.
+#[allow(clashing_extern_declarations)]
+#[cfg(unix)]
+extern "C" {
+    /// The SAME symbol, declared NON-variadic.
+    ///
+    /// On AArch64 Apple this changes where the third argument goes -- register
+    /// instead of stack -- so a difference in outcome between this and the
+    /// variadic declaration above IS cause A, measured rather than argued.
+    #[link_name = "ioctl"]
+    fn ioctl_fixed(fd: i32, request: u64, arg: *const WinSize) -> i32;
+    fn isatty(fd: i32) -> i32;
+}
+
+pub fn probe() {
+    unsafe {
+        println!("fancy-pty ioctl probe");
+        println!(
+            "  target: {} / {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        println!("  TIOCSWINSZ = 0x{TIOCSWINSZ:x}");
+        println!("  TIOCSCTTY  = 0x{TIOCSCTTY:x}");
+
+        let master = posix_openpt(O_RDWR | O_NOCTTY);
+        println!("  posix_openpt -> fd {master}");
+        if master < 0 {
+            println!("  FATAL: {}", std::io::Error::last_os_error());
+            return;
+        }
+        println!("  grantpt  -> {}", grantpt(master));
+        println!("  unlockpt -> {}", unlockpt(master));
+        println!("  isatty(master) -> {}", isatty(master));
+
+        let size = WinSize { ws_row: 31, ws_col: 97, ws_xpixel: 0, ws_ypixel: 0 };
+
+        // A, before any slave exists.
+        let a = ioctl(master, TIOCSWINSZ, &size);
+        println!(
+            "  [A] variadic decl, no slave open  -> {a}  errno={}",
+            if a == 0 { "-".to_string() } else { format!("{}", std::io::Error::last_os_error()) }
+        );
+
+        // A', the non-variadic declaration of the same symbol.
+        let b = ioctl_fixed(master, TIOCSWINSZ, &size);
+        println!(
+            "  [A'] NON-variadic decl, no slave  -> {b}  errno={}",
+            if b == 0 { "-".to_string() } else { format!("{}", std::io::Error::last_os_error()) }
+        );
+
+        // B: open the slave, then retry both.
+        let name = ptsname(master);
+        if name.is_null() {
+            println!("  ptsname -> NULL: {}", std::io::Error::last_os_error());
+            return;
+        }
+        let len = strlen(name);
+        let mut path = Vec::with_capacity(len + 1);
+        std::ptr::copy_nonoverlapping(name, path.as_mut_ptr(), len + 1);
+        path.set_len(len + 1);
+        let slave = open(path.as_ptr(), O_RDWR | O_NOCTTY, 0);
+        println!("  slave open -> fd {slave}");
+
+        let c = ioctl(master, TIOCSWINSZ, &size);
+        println!(
+            "  [B] variadic decl, slave OPEN     -> {c}  errno={}",
+            if c == 0 { "-".to_string() } else { format!("{}", std::io::Error::last_os_error()) }
+        );
+
+        let d = if slave >= 0 { ioctl(slave, TIOCSWINSZ, &size) } else { -1 };
+        println!(
+            "  [C] on the SLAVE fd               -> {d}  errno={}",
+            if d == 0 { "-".to_string() } else { format!("{}", std::io::Error::last_os_error()) }
+        );
+
+        println!();
+        println!("  VERDICT:");
+        if a == 0 {
+            println!("    the original call works here; this platform is not the problem");
+        } else if b == 0 {
+            println!("    cause A -- the VARIADIC declaration is wrong on this ABI.");
+            println!("    Fix: declare ioctl non-variadically for the fixed 3-arg form.");
+        } else if c == 0 || d == 0 {
+            println!("    cause B -- ORDERING. The size must be set once a slave exists");
+            println!("    (master-after-slave: {}, slave fd: {}).", c == 0, d == 0);
+        } else {
+            println!("    NEITHER. The constant itself is wrong, or something else is.");
+        }
+
+        if slave >= 0 {
+            close(slave);
+        }
+        close(master);
+    }
+}

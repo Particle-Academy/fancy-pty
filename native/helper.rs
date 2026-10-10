@@ -256,6 +256,13 @@ fn main() {
         return;
     }
 
+    // Diagnostic, not a feature. See `posix::probe`.
+    #[cfg(unix)]
+    if std::env::args().nth(1).as_deref() == Some("--probe-pty") {
+        posix::probe();
+        return;
+    }
+
     let out = Arc::new(Out(Mutex::new(std::io::stdout())));
     let mut stdin = std::io::stdin();
 

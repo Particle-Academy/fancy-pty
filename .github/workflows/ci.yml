@@ -138,6 +138,16 @@ jobs:
       - name: Build the JS
         run: npx tsup
 
+      # Diagnostic, before the live suite, and NOT gated on the live suite
+      # passing -- the whole reason it exists is that the live suite only says
+      # "ENOTTY" and cannot say which of two causes produced it. Running it on
+      # Linux as well is deliberate: the Linux constants were read off the
+      # system headers, so Linux output is the positive control. A probe that
+      # reports a failure there too is a broken probe, not a broken ioctl.
+      - name: ioctl probe (POSIX diagnosis)
+        if: matrix.live && runner.os != 'Windows'
+        run: ./bin/${{ matrix.target }}/fancy-pty-helper --probe-pty
+
       # The live suite needs a real pty, so it only runs where the backend is
       # implemented AND the binary is native. Listed per-target rather than
       # guessed, so adding the POSIX backend is a one-word edit here and the

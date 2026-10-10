@@ -158,7 +158,25 @@ export function open(options: PtyOptions): Pty {
      * that never closes, and the consumer cannot tell that from a shell sitting
      * idle at a prompt.
      */
-    child.on("exit", (code, signal) => {
+    /**
+     * `close`, NOT `exit` — and this is a correctness bug CI caught, not a
+     * preference.
+     *
+     * Node's `exit` fires when the process ends, which can be BEFORE its stdio
+     * streams have been drained. So on a fast platform the process-exit
+     * fallback below can win the race against the final stdout chunk, and a pty
+     * that completed perfectly reports an error with its output thrown away.
+     *
+     * It passed on Windows because a spawn there costs ~56 ms and the data is
+     * long since delivered. On Linux a whole pty lifecycle takes **2 ms**, and
+     * `test/live/pty.live.mjs` case 5 — the only case with no `sleep` before
+     * reading — failed there and only there. A race that one platform hides is
+     * the reason the live suite runs on all of them.
+     *
+     * `close` is emitted only after every stdio stream is closed, so any EXIT
+     * frame still in flight has already been decoded by then.
+     */
+    child.on("close", (code, signal) => {
         if (exited) return;
         exited = true;
         exitCode = code ?? 1;
