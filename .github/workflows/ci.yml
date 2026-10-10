@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The pure half: protocol codec, path rules, types. Hermetic and fast, so it
+  # runs on one platform -- none of it touches a pty.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Third-party dependency allowlist. Cheap, and failing here is cheap --
+      # the same check gates the release, so a PR adding an unapproved or
+      # abandoned dependency finds out now rather than at tag time. The
+      # allowlist is FETCHED, never vendored: one source, no copies to drift.
+      #
+      # Worth noting what it has to check here: this package's RUNTIME
+      # dependency count is zero, and the Rust side uses no crates, so the only
+      # surface is devDependencies.
+      - name: Fetch the third-party allowlist
+        uses: actions/checkout@v7
+        with:
+          repository: Particle-Academy/.github
+          path: .third-party-allowlist
+          persist-credentials: false
+
+      - name: Third-party dependency allowlist
+        run: |
+          node .third-party-allowlist/third-party/check.mjs --repo .
+          node -e "require('node:fs').rmSync('.third-party-allowlist',{recursive:true,force:true})"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Type-check
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  # The helper must COMPILE for every target we ship, on every push -- not only
+  # at release time. A target that stopped building would otherwise be found by
+  # the publish gate, which is the worst moment to find it.
+  helper:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win32-x64
+            live: true
+          - os: windows-latest
+            target: win32-arm64
+            live: false # cross-compiled; running it here would test the emulator
+          - os: macos-latest
+            target: darwin-arm64
+            live: false # POSIX backend not implemented yet
+          - os: macos-latest
+            target: darwin-x64
+            live: false
+          - os: ubuntu-latest
+            target: linux-x64
+            live: false
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            live: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # GitHub's runners ship a Rust toolchain. Only the cross targets need an
+      # extra std, and rustup supplies Rust's OWN std for them -- a toolchain
+      # download, not a third-party dependency of this package.
+      - name: Add the Rust target
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            win32-x64)    triple=x86_64-pc-windows-msvc ;;
+            win32-arm64)  triple=aarch64-pc-windows-msvc ;;
+            darwin-x64)   triple=x86_64-apple-darwin ;;
+            darwin-arm64) triple=aarch64-apple-darwin ;;
+            linux-x64)    triple=x86_64-unknown-linux-gnu ;;
+            linux-arm64)  triple=aarch64-unknown-linux-gnu ;;
+          esac
+          rustup target add "$triple"
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Build the helper
+        run: node scripts/build-helper.mjs --target ${{ matrix.target }}
+
+      # Verify the binary is actually for the architecture it claims, by reading
+      # its own header. The failure being designed out: node-pty's packaging
+      # hook reported `already-present, ok: true` over a HOST-arch dll on a
+      # cross-arch build, because it checked that files were PRESENT before
+      # anything read the target arch -- and the installer was green with a
+      # terminal that could not start. A present-files check is the one that
+      # passes on the broken build.
+      # `check-helpers.mjs` deliberately does NOT run here: it requires all six
+      # binaries and only one is built per job, so it would always fail. Adding
+      # `|| true` to it would be worse than omitting it -- a step whose failure
+      # is swallowed reads as a check while asserting nothing, and it is the
+      # shape that makes a reviewer stop looking. The full set is gated at
+      # publish time, where the set actually exists.
+      - name: Check THIS target's architecture
+        shell: bash
+        run: |
+          node -e "
+            const { readFileSync } = require('node:fs');
+            const key = '${{ matrix.target }}';
+            const exe = 'bin/' + key + '/fancy-pty-helper' + (key.startsWith('win32') ? '.exe' : '');
+            const b = readFileSync(exe);
+            const want = { 'win32-x64': 0x8664, 'win32-arm64': 0xaa64, 'linux-x64': 0x3e, 'linux-arm64': 0xb7, 'darwin-x64': 0x01000007, 'darwin-arm64': 0x0100000c }[key];
+            let got;
+            if (b[0] === 0x4d && b[1] === 0x5a) got = b.readUInt16LE(b.readUInt32LE(0x3c) + 4);
+            else if (b[0] === 0x7f && b[1] === 0x45) got = b.readUInt16LE(18);
+            else got = b.readUInt32LE(4);
+            if (got !== want) { console.error('arch mismatch: got 0x' + got.toString(16) + ' want 0x' + want.toString(16)); process.exit(1); }
+            console.log(exe + ': 0x' + got.toString(16) + ' — correct for ' + key);
+          "
+
+      - name: Build the JS
+        run: npx tsup
+
+      # The live suite needs a real pty, so it only runs where the backend is
+      # implemented AND the binary is native. Listed per-target rather than
+      # guessed, so adding the POSIX backend is a one-word edit here and the
+      # absence stays visible until then.
+      - name: Live suite
+        if: matrix.live
+        run: node --expose-gc test/live/pty.live.mjs

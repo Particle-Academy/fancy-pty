@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Built helper binaries. NOT committed: they are build output, they are
+# per-platform, and six of them would make every clone carry five it cannot
+# run. CI builds them on each target and the publish job assembles the tarball;
+# `npm run build:helper` builds the host one for local work.
+bin/*/
+
+# Rust build leftovers from building the helper in place.
+native/*.pdb
+native/*.exe
+native/fancy-pty-helper

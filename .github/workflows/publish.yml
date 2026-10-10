@@ -1,0 +1,151 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  # Every helper is built on its own runner and uploaded. The publish job
+  # downloads all six, so a tarball can only exist with a complete set --
+  # a partial one is not something a mistake can produce here.
+  helpers:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: windows-latest, target: win32-x64, triple: x86_64-pc-windows-msvc }
+          - { os: windows-latest, target: win32-arm64, triple: aarch64-pc-windows-msvc }
+          - { os: macos-latest, target: darwin-arm64, triple: aarch64-apple-darwin }
+          - { os: macos-latest, target: darwin-x64, triple: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: linux-x64, triple: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: linux-arm64, triple: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - run: rustup target add ${{ matrix.triple }}
+      - run: node scripts/build-helper.mjs --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: helper-${{ matrix.target }}
+          path: bin/${{ matrix.target }}/
+          if-no-files-found: error
+
+  publish:
+    needs: helpers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Release gate: a tag with no CHANGELOG entry fails HERE, before the
+      # package reaches the registry. A published version whose changes are
+      # undocumented cannot be repaired later -- the tarball is already out, and
+      # whoever upgraded into it has no way to learn what changed.
+      - name: Changelog entry for this tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::No CHANGELOG.md. Every package keeps one."
+            exit 1
+          fi
+          if ! grep -qE "^## +\[?v?${VERSION}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for ${VERSION}. Add one — say what a consumer must DO — then re-tag."
+            exit 1
+          fi
+          # ORDER, not just presence. A consumer deciding whether to upgrade
+          # reads top-down, so complete-but-mis-ordered is a truthful-looking
+          # lie -- and it is invisible to whoever wrote it, because they are
+          # looking at their own entry rather than at the file.
+          FIRST=$(grep -E '^## ' CHANGELOG.md | grep -viE '^## +\[?unreleased\]?' | head -1)
+          if ! printf '%s' "$FIRST" | grep -qE "^## +\[?v?${VERSION}\]?"; then
+            echo "::error::CHANGELOG.md has an entry for ${VERSION}, but it is NOT the first version heading."
+            echo "::error::Top of file is: ${FIRST}"
+            exit 1
+          fi
+          echo "Found changelog entry for ${VERSION}, and it is the newest."
+
+      # The allowlist is FETCHED, never vendored: one source of truth, so no
+      # per-repo copy can drift out of agreement with it.
+      - name: Fetch the third-party allowlist
+        uses: actions/checkout@v7
+        with:
+          repository: Particle-Academy/.github
+          path: .third-party-allowlist
+          persist-credentials: false
+
+      - name: Third-party dependency allowlist
+        run: |
+          node .third-party-allowlist/third-party/check.mjs --repo .
+          node -e "require('node:fs').rmSync('.third-party-allowlist',{recursive:true,force:true})"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Collect every helper
+        uses: actions/download-artifact@v6
+        with:
+          pattern: helper-*
+          path: .helpers
+
+      - name: Place them under bin/<platform>-<arch>/
+        run: |
+          for dir in .helpers/helper-*; do
+            key="${dir#.helpers/helper-}"
+            mkdir -p "bin/$key"
+            cp -r "$dir"/. "bin/$key"/
+            # upload-artifact does not preserve the executable bit.
+            chmod +x "bin/$key"/fancy-pty-helper 2>/dev/null || true
+          done
+          ls -lR bin
+
+      - name: Install
+        run: npm ci
+
+      # THE GATE THAT MATTERS, and it is the one node-pty's packaging did not
+      # have: every binary's own PE / ELF / Mach-O header is read and compared
+      # with the directory it sits in. A present-files check reported
+      # `already-present, ok: true` over a host-arch dll on a cross-arch build,
+      # and the installer was green with a terminal that could not start.
+      - name: Verify all six helpers, by their own headers
+        run: node scripts/check-helpers.mjs
+
+      - name: Build the JS
+        run: npx tsup
+
+      # Trusted Publishing (OIDC) -- no tokens. Needs npm 11.5.1+ (the runner
+      # ships npm 10.x), hence the pinned npx. 11.18.0 specifically: 12.0.0
+      # broke provenance in this estate.
+      - name: Publish
+        run: npx -y npm@11.18.0 publish --provenance --access public
+
+      # A package can be fully published and completely invisible on GitHub --
+      # measured across this estate, every TypeScript repo publishing to npm
+      # had zero GitHub releases, one of them on 5.30.0 with 100 tags and an
+      # empty Releases page. Automated rather than left to a checklist, because
+      # a manual step is what produced that gap. It runs AFTER the npm publish
+      # deliberately: the tarball is immutable, so a release announcing a
+      # version that failed to publish could not be walked back.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; leaving it alone."
+            exit 0
+          fi
+          awk -v v="$VERSION" '
+            /^## / { if (found) exit; if (index($0, v)) { found = 1 }; next }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+          echo "Published release $GITHUB_REF_NAME."

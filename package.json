@@ -1,0 +1,72 @@
+{
+    "name": "@particle-academy/fancy-pty",
+    "version": "0.0.0",
+    "description": "Zero-dependency pseudo-terminal for Node: a tiny native helper executable plus pure JS. No native addon, no node-gyp, no node-addon-api, no Electron ABI rebuild, no prebuilds to resolve.",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Particle-Academy/fancy-pty.git"
+    },
+    "homepage": "https://github.com/Particle-Academy/fancy-pty#readme",
+    "bugs": "https://github.com/Particle-Academy/fancy-pty/issues",
+    "type": "module",
+    "main": "./dist/index.cjs",
+    "module": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "import": {
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            },
+            "require": {
+                "types": "./dist/index.d.cts",
+                "default": "./dist/index.cjs"
+            }
+        },
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "dist",
+        "bin",
+        "native",
+        "README.md",
+        "LICENSE",
+        "CHANGELOG.md"
+    ],
+    "scripts": {
+        "build": "npm run build:helper && tsup",
+        "build:helper": "node scripts/build-helper.mjs",
+        "dev": "tsup --watch",
+        "lint": "tsc --noEmit",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "verify:pty": "node --expose-gc test/live/pty.live.mjs",
+        "clean": "rm -rf dist bin/*/",
+        "prepublishOnly": "node scripts/check-helpers.mjs && tsup"
+    },
+    "keywords": [
+        "pty",
+        "pseudo-terminal",
+        "terminal",
+        "conpty",
+        "shell",
+        "node-pty",
+        "zero-dependency",
+        "electron",
+        "fancy",
+        "fancy-term"
+    ],
+    "devDependencies": {
+        "@types/node": "^22",
+        "tsup": "^8.5.0",
+        "typescript": "^5.8.0",
+        "vitest": "^5.0.3"
+    },
+    "engines": {
+        "node": ">=22"
+    },
+    "publishConfig": {
+        "access": "public"
+    },
+    "license": "MIT"
+}
