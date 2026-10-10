@@ -65,16 +65,16 @@ jobs:
             live: false # cross-compiled; running it here would test the emulator
           - os: macos-latest
             target: darwin-arm64
-            live: false # POSIX backend not implemented yet
+            live: true
           - os: macos-latest
             target: darwin-x64
-            live: false
+            live: false # cross-compiled from an arm64 runner
           - os: ubuntu-latest
             target: linux-x64
-            live: false
+            live: true
           - os: ubuntu-24.04-arm
             target: linux-arm64
-            live: false
+            live: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

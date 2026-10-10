@@ -120,10 +120,46 @@ gauges rise — for the same reason. The absence of that control is arguably the
 root cause of `genie#805`: 7,158 spawns and 7,116 exits sat in a log for four
 days while nothing compared threads to live terminals.
 
+### Three POSIX traps (`native/posix.rs`)
+
+**1. Nothing may allocate between `fork()` and `execvp()`.** Only
+async-signal-safe calls are legal there — allocating, formatting a string or
+taking a lock can deadlock against a mutex another thread held at the instant of
+the fork. So every C string and pointer array the child needs is built BEFORE
+the fork, and the child path is deliberately dull. This is the easiest place in
+the package to write a bug that appears only under concurrency, i.e. never in a
+test that opens one pty.
+
+**2. `EIO` from reading the master is EOF, not an error.** When the last slave
+fd closes, Linux fails the read with `EIO` where macOS returns 0. Treating it as
+a fault makes every normal shell exit look like a crash — and a backend
+developed only on macOS would ship with Linux terminals that always "error" on
+close.
+
+**3. A resize is an ioctl AND a signal.** `TIOCSWINSZ` changes what `stty size`
+reports; only `SIGWINCH` makes a running program re-read it. Doing just the
+ioctl is the version of this bug that looks like it works, because the obvious
+test (`stty size`) passes.
+
+`setsid()` is what allows `TIOCSCTTY`, and it also makes the child a
+process-group leader — which is why `killpg(pgid, …)` takes the whole tree, the
+POSIX counterpart of the job object on Windows.
+
+The ioctl constants carry their provenance in a comment, because a wrong one is
+a runtime-only failure: the Linux values were read off Ubuntu's own headers, and
+the macOS values were DERIVED from the BSD `_IOW`/`_IO` encoding. A `cfg` branch
+is the one kind of code a typecheck cannot vouch for — only one arm compiles on
+any machine — so the macOS CI job is where that arm is proven.
+
 ## Status
 
-Windows works end to end. **POSIX is not implemented**, and the backend returns
-an error rather than a silent success — a stub reporting OK would claim a
-working terminal that carries nothing, which is the failure shape this package
-exists to stop shipping. Nothing has been published; the npm name does not exist
-yet.
+**Windows works end to end**, verified locally: real shells, resize, kill, zero
+orphans, and the leak bar at 0.009 MB / 0.000 handles per exited pty.
+
+**POSIX is written and typechecks for `linux-x64` and `aarch64-apple-darwin`,
+but has not yet RUN anywhere.** CI is the first exercise of it — the live suite
+is enabled on `linux-x64`, `linux-arm64` and `darwin-arm64`. Until one of those
+jobs is green, treat the POSIX backend as unproven, and say so rather than
+rounding "it compiles" up to "it works".
+
+Nothing has been published; the npm name does not exist yet.

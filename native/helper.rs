@@ -12,6 +12,9 @@
 //! Protocol: see proto.md. Framed on stdin/stdout, with stderr left free for
 //! diagnostics so a crashing helper can still say why.
 
+// Only the Windows backend speaks in raw C pointers; the POSIX one uses
+// typed fds, so this would be an unused import there.
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -837,12 +840,24 @@ fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<u32,
     win::run(req, out, control)
 }
 
-#[cfg(not(windows))]
+// ============================================================= POSIX backend
+
+#[cfg(unix)]
+mod posix {
+    use super::*;
+    include!("posix.rs");
+}
+
+#[cfg(unix)]
+fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<u32, String> {
+    posix::run(req, out, control)
+}
+
+// Neither Windows nor unix. There is no third branch that could work, so this
+// refuses rather than returning a success nobody can act on: a backend that
+// reported Ok would claim a working terminal carrying nothing, which is the
+// failure shape this whole package exists to stop shipping.
+#[cfg(not(any(windows, unix)))]
 fn run(_req: SpawnRequest, _out: Arc<Out>, _control: std::io::Stdin) -> Result<u32, String> {
-    // POSIX is posix_openpt/grantpt/unlockpt/ptsname plus fork/setsid/
-    // ioctl(TIOCSCTTY). Not yet written -- and deliberately NOT stubbed as a
-    // silent success: a backend that returns Ok would report a working terminal
-    // that carries nothing, which is the failure shape this whole package
-    // exists to stop shipping.
-    Err("POSIX backend not implemented yet".into())
+    Err("fancy-pty: no backend for this platform".into())
 }

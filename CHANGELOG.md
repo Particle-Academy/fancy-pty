@@ -42,11 +42,14 @@ version number is not a stability promise until 1.0; read the entry.
   built ESM Electron main bundle leaves packages external, and Node refuses a
   named import from a CJS package with getter-defined exports. CJS is carried
   too, for everyone else.
-- POSIX (`posix_openpt` / `grantpt` / `unlockpt` / `ptsname` plus
-  `fork`/`setsid`/`ioctl(TIOCSCTTY)`) is **not implemented yet**, and the
-  backend returns an error rather than a silent success — a stub that reported
-  OK would claim a working terminal that carries nothing, which is the failure
-  shape this package exists to stop shipping.
+- **The POSIX backend is written but has not yet RUN anywhere.**
+  `posix_openpt` / `grantpt` / `unlockpt` / `ptsname`, then
+  `fork` + `setsid` + `ioctl(TIOCSCTTY)` + `dup2` + `execvp`, with a CLOEXEC
+  errno pipe so a failed exec is reported rather than appearing as a shell that
+  exited 127. It typechecks for `x86_64-unknown-linux-gnu` and
+  `aarch64-apple-darwin`, and CI's live jobs on `linux-x64`, `linux-arm64` and
+  `darwin-arm64` are its first real exercise. Until one of those is green it is
+  unproven — "it compiles" is not "it works".
 
 <!--
 Nothing has been released yet. The first publish needs the npm name to exist,
