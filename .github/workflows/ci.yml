@@ -43,8 +43,13 @@ jobs:
       - name: Install
         run: npm install --no-audit --no-fund
 
-      - name: Type-check
-        run: npm run lint
+      # tsc only here. `npm run lint` also typechecks the helper for all six
+      # native targets, which needs six Rust stds — and the `helper` matrix
+      # below already COMPILES all six for real, which is the stronger check.
+      # Downloading them again for a metadata-only pass would be slower and
+      # prove less.
+      - name: Type-check (TypeScript)
+        run: npx tsc --noEmit
 
       - name: Test
         run: npm test

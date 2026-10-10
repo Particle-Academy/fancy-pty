@@ -37,12 +37,13 @@
         "build": "npm run build:helper && tsup",
         "build:helper": "node scripts/build-helper.mjs",
         "dev": "tsup --watch",
-        "lint": "tsc --noEmit",
+        "lint": "tsc --noEmit && node scripts/check-native.mjs",
         "test": "vitest run",
         "test:watch": "vitest",
         "verify:pty": "node --expose-gc test/live/pty.live.mjs",
         "clean": "rm -rf dist bin/*/",
-        "prepublishOnly": "node scripts/check-helpers.mjs && tsup"
+        "prepublishOnly": "node scripts/check-helpers.mjs && tsup",
+        "lint:native": "node scripts/check-native.mjs"
     },
     "keywords": [
         "pty",

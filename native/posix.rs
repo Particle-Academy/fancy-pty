@@ -13,7 +13,16 @@
 // is deliberately dull. This is the single easiest place in the package to
 // write a bug that appears only under concurrency.
 
+use std::ffi::c_char;
 use std::ffi::CString;
+
+// `c_char` rather than `i8`, everywhere a C string is involved.
+//
+// **`c_char` is UNSIGNED on aarch64-linux and SIGNED on x86_64-linux and
+// macOS.** Hardcoding `i8` compiled on four of our six targets and failed only
+// on `linux-arm64` — caught by CI's arm64 runner on this file's first real
+// build. The six-target matrix exists for exactly this: a type whose width is
+// the same everywhere and whose SIGN is not.
 
 type Pid = i32;
 
@@ -74,8 +83,8 @@ extern "C" {
     fn posix_openpt(flags: i32) -> i32;
     fn grantpt(fd: i32) -> i32;
     fn unlockpt(fd: i32) -> i32;
-    fn ptsname(fd: i32) -> *mut i8;
-    fn open(path: *const i8, flags: i32, ...) -> i32;
+    fn ptsname(fd: i32) -> *mut c_char;
+    fn open(path: *const c_char, flags: i32, ...) -> i32;
     fn close(fd: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
     fn write(fd: i32, buf: *const u8, n: usize) -> isize;
@@ -83,13 +92,13 @@ extern "C" {
     fn fork() -> Pid;
     fn setsid() -> Pid;
     fn dup2(old: i32, new: i32) -> i32;
-    fn execvp(file: *const i8, argv: *const *const i8) -> i32;
+    fn execvp(file: *const c_char, argv: *const *const c_char) -> i32;
     fn _exit(code: i32) -> !;
     fn waitpid(pid: Pid, status: *mut i32, options: i32) -> Pid;
     fn killpg(pgrp: Pid, sig: i32) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-    fn strlen(s: *const i8) -> usize;
+    fn strlen(s: *const c_char) -> usize;
 }
 
 fn errno() -> i32 {
@@ -155,7 +164,7 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
         if slave_name_ptr.is_null() {
             return Err(oserr("ptsname"));
         }
-        let slave_path: Vec<i8> = {
+        let slave_path: Vec<c_char> = {
             let len = strlen(slave_name_ptr);
             let mut v = Vec::with_capacity(len + 1);
             std::ptr::copy_nonoverlapping(slave_name_ptr, v.as_mut_ptr(), len + 1);
@@ -163,15 +172,27 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             v
         };
 
+        // The initial size is applied by the CHILD, on the slave fd, not here on
+        // the master — and that ordering is a MEASURED requirement rather than
+        // a preference.
+        //
+        // `ioctl(master, TIOCSWINSZ)` before any slave is open works on Linux
+        // and returns **ENOTTY on macOS**: the master does not accept terminal
+        // ioctls until the slave side exists. Established by `--probe-pty` on a
+        // macOS CI runner, which separated it from the other credible cause —
+        // the AArch64 Apple variadic ABI — by declaring the same `ioctl` symbol
+        // a second time non-variadically and getting the identical ENOTTY. The
+        // constant (0x80087467) was never wrong; the ORDER was.
+        //
+        // Built before the fork, deliberately: the child may not allocate, and
+        // a Copy struct on the parent's stack is simply there in the child's
+        // copied address space.
         let size = WinSize {
             ws_row: req.rows.max(1),
             ws_col: req.cols.max(1),
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        if ioctl(master.get(), TIOCSWINSZ, &size) != 0 {
-            return Err(oserr("ioctl(TIOCSWINSZ)"));
-        }
 
         // --------------------------------------------------------------------
         // Everything the child needs, built BEFORE the fork.
@@ -188,7 +209,7 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             .map(|a| CString::new(a.as_bytes()))
             .collect::<Result<_, _>>()
             .map_err(|_| "argv contains an interior NUL".to_string())?;
-        let mut argv_ptrs: Vec<*const i8> = c_argv.iter().map(|c| c.as_ptr()).collect();
+        let mut argv_ptrs: Vec<*const c_char> = c_argv.iter().map(|c| c.as_ptr()).collect();
         argv_ptrs.push(std::ptr::null());
 
         let c_env: Vec<CString> = req
@@ -197,7 +218,7 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             .map(|(k, v)| CString::new(format!("{k}={v}")))
             .collect::<Result<_, _>>()
             .map_err(|_| "env contains an interior NUL".to_string())?;
-        let mut env_ptrs: Vec<*const i8> = c_env.iter().map(|c| c.as_ptr()).collect();
+        let mut env_ptrs: Vec<*const c_char> = c_env.iter().map(|c| c.as_ptr()).collect();
         env_ptrs.push(std::ptr::null());
 
         let c_cwd = if req.cwd.is_empty() {
@@ -259,6 +280,13 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
                 fail(126);
             }
 
+            // The window size, now that a slave exists. Setting it on the
+            // slave rather than the master works on both platforms, where the
+            // master-side call works on only one.
+            if ioctl(slave, TIOCSWINSZ, &size) != 0 {
+                fail(126);
+            }
+
             if dup2(slave, 0) < 0 || dup2(slave, 1) < 0 || dup2(slave, 2) < 0 {
                 fail(126);
             }
@@ -274,7 +302,7 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
 
             if let Some(cwd) = &c_cwd {
                 extern "C" {
-                    fn chdir(path: *const i8) -> i32;
+                    fn chdir(path: *const c_char) -> i32;
                 }
                 if chdir(cwd.as_ptr()) != 0 {
                     fail(126);
@@ -285,7 +313,7 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             // directly and use `execvp` — which reads it — rather than carrying
             // two code paths.
             extern "C" {
-                static mut environ: *const *const i8;
+                static mut environ: *const *const c_char;
             }
             environ = env_ptrs.as_ptr();
 
@@ -535,7 +563,7 @@ pub fn probe() {
             return;
         }
         let len = strlen(name);
-        let mut path = Vec::with_capacity(len + 1);
+        let mut path: Vec<c_char> = Vec::with_capacity(len + 1);
         std::ptr::copy_nonoverlapping(name, path.as_mut_ptr(), len + 1);
         path.set_len(len + 1);
         let slave = open(path.as_ptr(), O_RDWR | O_NOCTTY, 0);
