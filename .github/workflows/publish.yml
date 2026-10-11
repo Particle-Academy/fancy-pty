@@ -11,6 +11,13 @@ jobs:
   # downloads all six, so a tarball can only exist with a complete set --
   # a partial one is not something a mistake can produce here.
   helpers:
+    # Least privilege, explicitly. CodeQL's `actions/missing-workflow-permissions`
+    # flagged this job: it needs only to read the repo and upload an artifact, so
+    # a default GITHUB_TOKEN with write scopes is scope it never uses. The
+    # `publish` job below declares its own wider set because it genuinely writes
+    # a release and mints an OIDC token.
+    permissions:
+      contents: read
     strategy:
       fail-fast: true
       matrix:

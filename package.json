@@ -57,6 +57,9 @@
         "fancy",
         "fancy-term"
     ],
+    "overrides": {
+        "esbuild": "^0.28.1"
+    },
     "devDependencies": {
         "@types/node": "^22",
         "tsup": "^8.5.0",
