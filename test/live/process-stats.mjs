@@ -92,11 +92,23 @@ export function processStats(pid = process.pid) {
         } catch {
             threads = null;
         }
-        // Deliberately NOT guessed. `lsof` is the only general answer, it is
-        // slow enough to distort a timing-sensitive loop, and it is not present
-        // on every runner. Reported as unavailable so the caller skips it
-        // loudly.
-        return { threads, handles: null, rss, handlesLabel: "open fds (unavailable)" };
+        // `/dev/fd` is macOS's equivalent of `/proc/self/fd` for the CALLING
+        // process, so no `lsof` and no subprocess.
+        //
+        // This was `null` on the first pass, and the positive control
+        // immediately reported "20 live ptys moved NOTHING" on macOS -- because
+        // threads legitimately do not move here (they live in the helper
+        // processes) and fds were the only other instrument. That is the
+        // control doing its job: it said the check could not go red on this
+        // platform, instead of letting a memory-only pass look like three
+        // green assertions.
+        let handles = null;
+        try {
+            handles = readdirSync("/dev/fd").length;
+        } catch {
+            handles = null;
+        }
+        return { threads, handles, rss, handlesLabel: "open fds" };
     }
 
     return { threads: null, handles: null, rss, handlesLabel: "unavailable" };

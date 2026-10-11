@@ -14,6 +14,7 @@
 // write a bug that appears only under concurrency.
 
 use std::ffi::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::ffi::CString;
 
 // `c_char` rather than `i8`, everywhere a C string is involved.
@@ -353,7 +354,18 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
         let pgid = child;
         let master_fd = master.into_raw();
 
+        // Set immediately before we close the master, so the reader can tell
+        // "the fd went away because WE closed it" from a genuine fault. Without
+        // it a teardown race surfaces to the consumer as an error frame on a
+        // perfectly healthy pty.
+        let tearing_down = Arc::new(AtomicBool::new(false));
+
+        // The reader signals here the instant it has drained. That is what lets
+        // the close WAIT for the drain instead of racing it.
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel::<()>();
+
         let reader_out = out.clone();
+        let reader_flag = tearing_down.clone();
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             loop {
@@ -376,11 +388,17 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
                     if e == EIO {
                         break;
                     }
-                    reader_out.frame(T_ERROR, oserr("read(pty)").as_bytes());
+                    // EBADF because the teardown below closed the fd under us
+                    // is expected and silent; EBADF at any other time is a
+                    // real fault and still reported.
+                    if !reader_flag.load(Ordering::SeqCst) {
+                        reader_out.frame(T_ERROR, oserr("read(pty)").as_bytes());
+                    }
                     break;
                 }
                 break; // n == 0
             }
+            let _ = drained_tx.send(());
         });
 
         let control_out = out.clone();
@@ -458,10 +476,29 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             break;
         }
 
-        // Closing the master is what ends the reader: the slave side is already
-        // gone with the child, and this releases the last reference.
+        // DRAIN FIRST, THEN CLOSE -- the opposite order loses output, and CI
+        // caught it rather than review.
+        //
+        // The master read ends by itself once every slave fd is closed: EIO on
+        // Linux, 0 on macOS. Closing the master immediately after `waitpid`
+        // instead RACES the reader, and for a command that exits in 2 ms the
+        // reader has not yet read anything, so it takes EBADF and **the
+        // command's entire output is lost**. On Linux CI that showed up as
+        // `read(pty) failed: Bad file descriptor` plus a silently empty
+        // terminal for `sh -c echo`; the same code had passed on a previous run
+        // and on arm64, which is what a race looks like.
+        //
+        // Bounded, because "wait for the drain" alone would hang if a
+        // GRANDCHILD still holds the slave open after the shell exits -- a
+        // backgrounded process is enough. So: wait briefly for the natural end,
+        // and force it only if that does not come.
+        let drained = drained_rx
+            .recv_timeout(std::time::Duration::from_millis(2000))
+            .is_ok();
+        tearing_down.store(true, Ordering::SeqCst);
         close(master_fd);
         let _ = reader.join();
+        let _ = drained;
 
         // WIFEXITED / WEXITSTATUS / WTERMSIG, open-coded because they are
         // macros and there is nothing to link against. A signalled child
