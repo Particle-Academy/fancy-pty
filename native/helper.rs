@@ -560,6 +560,49 @@ mod win {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    /// Explain a failed spawn in terms of the thing the caller passed.
+    ///
+    /// `CreateProcessW failed (GetLastError=2)` is accurate and tells a
+    /// consumer nothing. Worth the words because node-pty's version of this
+    /// error is `File not found: ` with NOTHING after the colon (the wide
+    /// string prints empty), measured by `claude - tynn` on Windows the same
+    /// day: an error that names neither the program nor the reason sends the
+    /// reader looking for a missing file that is sitting right there.
+    ///
+    /// THE RULE, measured rather than assumed -- the first version of this
+    /// function asserted that a `.cmd` cannot be spawned directly, and that is
+    /// FALSE. What is true:
+    ///
+    ///   * `CreateProcessW` appends `.exe` and NOTHING else. So a bare `cmd`
+    ///     resolves and a bare `npm` does not, because npm on Windows is
+    ///     `npm.cmd`.
+    ///   * With the extension present, a `.cmd` / `.bat` runs fine -- Windows
+    ///     invokes it through the command processor itself. `hello.cmd` works;
+    ///     `hello` does not.
+    ///
+    /// So the advice is just "pass the extension", which is both simpler and
+    /// correct. The wrong version would have sent a consumer to wrap every
+    /// script in `cmd.exe /c` for no reason.
+    fn spawn_error(program: &str) -> String {
+        let code = unsafe { GetLastError() };
+        let hint = match code {
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+                if std::path::Path::new(program).extension().is_none() {
+                    " -- not found on PATH. CreateProcessW appends .exe and NOTHING else,                      so a command that is really a .cmd or .bat (npm, npx, yarn) does not                      resolve bare: pass the extension (\"npm.cmd\"), or run it through a                      shell (argv: [\"cmd.exe\", \"/c\", \"npm\", ...])"
+                } else {
+                    " -- not found on PATH"
+                }
+            }
+            ERROR_ACCESS_DENIED => " -- access denied",
+            _ => "",
+        };
+        format!("cannot start {program:?} (CreateProcessW GetLastError={code}){hint}")
+    }
+
     fn last(what: &str) -> String {
         format!("{what} failed (GetLastError={})", unsafe { GetLastError() })
     }
@@ -698,7 +741,7 @@ mod win {
             );
             DeleteProcThreadAttributeList(list);
             if created == 0 {
-                let e = last("CreateProcessW");
+                let e = spawn_error(&req.argv[0]);
                 ClosePseudoConsole(hpcon);
                 return Err(e);
             }

@@ -14,6 +14,8 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { execFileSync } from "node:child_process";
 
+import { processStats } from "./process-stats.mjs";
+
 import { open, helperPath } from "../../dist/index.js";
 
 const isWindows = process.platform === "win32";
@@ -146,6 +148,65 @@ console.log("\n6. a failed spawn is an ERROR, never a silent empty terminal");
     ok(c.errors.length > 0, "and it reported an error");
 }
 
+// ------------------------------------------ 6b. Windows command resolution
+if (isWindows) {
+    console.log("\n6b. how a bare command name resolves on Windows");
+
+    // MEASURED, and pinned here so it cannot change silently. `claude · tynn`
+    // found that node-pty's conpty path throws `File not found: ` with nothing
+    // after the colon for a bare `cmd` -- a user typing `cmd` into a command
+    // box hits it. fancy-pty does NOT, because `CreateProcessW` appends `.exe`
+    // itself. But it appends ONLY `.exe`, so the rest of PATHEXT does not
+    // resolve, and that boundary is exactly what these three assertions fix in
+    // place.
+    const bare = open({ argv: ["cmd", "/c", "echo", "NOEXT-OK"], env: process.env });
+    const b = collect(bare);
+    await withTimeout(b.exit, 15000);
+    ok(b.text().includes("NOEXT-OK"), "a bare `cmd` resolves — CreateProcessW appends .exe");
+
+    // A .cmd file cannot be exec'd directly at all: it is not an executable
+    // image. Written to a temp file rather than relying on npm's layout, so the
+    // assertion does not depend on what the runner happens to have installed.
+    const { writeFileSync, mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const pathMod = await import("node:path");
+    const dir = mkdtempSync(pathMod.join(tmpdir(), "fancy-pty-res-"));
+    const script = pathMod.join(dir, "hello.cmd");
+    writeFileSync(script, "@echo BATCH-RAN\r\n");
+
+    // A .cmd WITH its extension runs — Windows invokes it through the command
+    // processor itself. This assertion exists because I assumed the opposite
+    // and wrote an error message saying so; the measurement said `hello.cmd`
+    // exits 0 and prints. Pinned so the claim in the error text stays true.
+    const batch = open({ argv: [script], env: process.env });
+    const bt = collect(batch);
+    await withTimeout(bt.exit, 15000);
+    ok(bt.text().includes("BATCH-RAN"), "a .cmd WITH its extension runs directly");
+    ok(bt.errors.length === 0, "and reports no error");
+
+    // Drop the extension and it does not resolve: `.exe` is the only one
+    // CreateProcessW appends. This is the real boundary, and the error has to
+    // say which side of it you are on.
+    const bare2 = open({ argv: [script.replace(/\.cmd$/, "")], env: process.env });
+    const b2 = collect(bare2);
+    await withTimeout(b2.exit, 15000);
+    ok(b2.errors.length > 0, "the SAME script without its extension fails");
+    ok(
+        b2.errors.some((e) => /appends \.exe and NOTHING else/.test(e.message)),
+        `and the error names the rule rather than just an errno (${b2.errors
+            .map((e) => e.message)
+            .join("; ")
+            .slice(0, 120)})`,
+    );
+
+    // The documented way to run one. This is what a consumer should do, so it
+    // is asserted rather than merely described.
+    const viaShell = open({ argv: ["cmd.exe", "/c", script], env: process.env });
+    const vs = collect(viaShell);
+    await withTimeout(vs.exit, 15000);
+    ok(vs.text().includes("BATCH-RAN"), "and running it through cmd.exe /c works");
+}
+
 // --------------------------------------------------------- 7. THE BAR
 console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
 {
@@ -158,10 +219,15 @@ console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
     await new Promise((r) => open({ argv: quick, env: process.env }).onExit(r));
     await sleep(400);
 
-    const gauge = () => ({
-        rss: process.memoryUsage().rss,
-        handles: process.report?.getReport?.()?.libuv?.length ?? -1,
-    });
+    // THE THREE QUANTITIES THE INCIDENT WAS MEASURED IN -- threads, OS
+    // handles, and resident memory. Not libuv handles, which an earlier version
+    // of this file used and which are a different thing in different units; see
+    // process-stats.mjs for what that cost.
+    const gauge = () => processStats();
+
+    const fmt = (s) =>
+        `threads ${s.threads ?? "n/a"}, ${s.handlesLabel} ${s.handles ?? "n/a"}, ` +
+        `rss ${(s.rss / 1e6).toFixed(1)} MB`;
 
     // A POSITIVE CONTROL first, because a leak check that has never seen the
     // gauges move is a check that cannot go red. Hold 20 ptys open and confirm
@@ -174,15 +240,21 @@ console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
         p.onData(() => {});
         live.push(p);
     }
-    await sleep(800);
+    await sleep(1200);
     const withLive = gauge();
-    ok(
-        withLive.handles > base.handles,
-        `positive control: ${20} live ptys moved libuv handles ${base.handles} -> ${withLive.handles}`,
-    );
+    console.log(`     idle:    ${fmt(base)}`);
+    console.log(`     20 live: ${fmt(withLive)}`);
+
+    // At least one gauge must move, and it is named -- "something went up" is
+    // not a control if you cannot say which instrument saw it.
+    const moved = [];
+    if (base.threads !== null && withLive.threads > base.threads) moved.push("threads");
+    if (base.handles !== null && withLive.handles > base.handles) moved.push("handles");
+    ok(moved.length > 0, `positive control: 20 live ptys moved ${moved.join(" + ") || "NOTHING"}`);
+
     for (const p of live) p.kill();
     await Promise.all(live.map((p) => new Promise((r) => p.onExit(r))));
-    await sleep(1200);
+    await sleep(1500);
 
     const before = gauge();
     const t0 = Date.now();
@@ -197,27 +269,48 @@ console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
 
     // Settle before measuring, or the reading is of Node's pending pipe
     // teardown rather than of anything the pty retained.
-    await sleep(1500);
+    await sleep(2000);
     if (global.gc) global.gc();
-    await sleep(200);
+    await sleep(300);
     const after = gauge();
 
+    const per = (a, b) => (a === null || b === null ? null : (b - a) / CYCLES);
+    const perThreads = per(before.threads, after.threads);
+    const perHandles = per(before.handles, after.handles);
     const perMb = (after.rss - before.rss) / 1024 / 1024 / CYCLES;
-    const perHandles = (after.handles - before.handles) / CYCLES;
 
+    console.log(`     ${exits}/${CYCLES} exited in ${ms} ms (${Math.round(ms / CYCLES)} ms each)`);
+    console.log(`     before:  ${fmt(before)}`);
+    console.log(`     after:   ${fmt(after)}`);
     console.log(
-        `     ${exits}/${CYCLES} exited in ${ms} ms (${Math.round(ms / CYCLES)} ms each)\n` +
-            `     rss ${(before.rss / 1e6).toFixed(1)} -> ${(after.rss / 1e6).toFixed(1)} MB   ` +
-            `libuv handles ${before.handles} -> ${after.handles}\n` +
-            `     per exited pty: ${perMb.toFixed(3)} MB, ${perHandles.toFixed(3)} handles`,
+        `     per exited pty: ${perThreads === null ? "n/a" : perThreads.toFixed(3)} threads, ` +
+            `${perHandles === null ? "n/a" : perHandles.toFixed(3)} ${before.handlesLabel}, ` +
+            `${perMb.toFixed(3)} MB`,
     );
 
     ok(exits === CYCLES, `every pty exited (${exits}/${CYCLES})`);
-    // `claude · tynn`'s thresholds, per exited pty, set so genie#805's numbers
-    // (~12 MB, ~11 handles, ~1 thread) fail by 10x and a tidy engine passes
-    // with headroom.
+
+    // `claude · tynn`'s thresholds, per exited pty, set so the incident's own
+    // numbers fail by 10x. Their Windows node-pty baseline, measured
+    // 2026-10-10 on a clean VM: 1.067 threads, 18.27 handles, 13.303 MB per
+    // EXITED pty -- so all three of these go red against the engine this
+    // replaces, which is what makes them worth asserting.
+    if (perThreads === null) {
+        // SKIPPED OUT LOUD. An unavailable metric is never scored as zero:
+        // that hands out a pass for a measurement that did not happen.
+        console.log("  SKIP threads <= 0.1 — this platform did not report a thread count");
+    } else {
+        ok(perThreads <= 0.1, `retained <= 0.1 threads per exited pty (${perThreads.toFixed(3)})`);
+    }
+    if (perHandles === null) {
+        console.log(`  SKIP handles <= 1.0 — this platform did not report ${before.handlesLabel}`);
+    } else {
+        ok(
+            perHandles <= 1.0,
+            `retained <= 1.0 ${before.handlesLabel} per exited pty (${perHandles.toFixed(3)})`,
+        );
+    }
     ok(perMb <= 0.5, `retained <= 0.5 MB per exited pty (${perMb.toFixed(3)})`);
-    ok(perHandles <= 1.0, `retained <= 1.0 handles per exited pty (${perHandles.toFixed(3)})`);
 }
 
 // ------------------------------------------------------- 8. no orphans
