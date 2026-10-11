@@ -44,7 +44,8 @@
         "verify:pty": "node --expose-gc test/live/pty.live.mjs",
         "clean": "rm -rf dist bin/*/",
         "prepublishOnly": "node scripts/check-helpers.mjs && tsup",
-        "lint:native": "node scripts/check-native.mjs"
+        "lint:native": "node scripts/check-native.mjs",
+        "verify:flash": "python -I scripts/console-flash-probe.py --verify"
     },
     "keywords": [
         "pty",

@@ -106,6 +106,7 @@ npm test              # pure protocol, fast + hermetic
 npm run lint          # tsc --noEmit
 npm run build:helper  # rustc + the helper's --selftest
 npm run verify:pty    # LIVE: real shells, resize, kill, orphan sweep, leak bar
+npm run verify:flash  # LIVE, Windows: no console window ever APPEARS (#4)
 ```
 
 **A new assertion here must be verified to FAIL against the bug it describes.**
@@ -119,6 +120,52 @@ create it. Sabotage the code, watch the test go red, then restore.
 gauges rise — for the same reason. The absence of that control is arguably the
 root cause of `genie#805`: 7,158 spawns and 7,116 exits sat in a log for four
 days while nothing compared threads to live terminals.
+
+### `verify:flash` — no console window ever APPEARS (#4)
+
+Windows only, and the same shape as the leak bar: the claim is a negative, so
+the run is worthless unless the instrument is shown to fire first.
+
+`fancy-term-host` #4 was a console **flash** — node-pty's legacy ConPTY path
+forked an un-hidden agent whose teardown popped a console and then died with
+"AttachConsole failed". The architectural answer is that this package ships no
+agent process, so there is no second executable to pop a window. That is a good
+argument and it is not a measurement, which is why this exists.
+
+Two things make it real rather than reassuring:
+
+- **The discriminator is the SHOW, not the window.** ConPTY legitimately creates
+  a `PseudoConsoleWindow` for *every* pty, so counting those proves nothing —
+  this was measured, not assumed. A genuinely visible console produces
+  `EVENT_OBJECT_CREATE` with `vis=False` and then `EVENT_OBJECT_SHOW` with
+  `vis=True`. A correctly hidden one produces the create and **never** the show.
+- **`--verify` runs a positive control FIRST** and declares the run **VOID**, not
+  passing, if the probe fails to see a console it opened itself. A probe that
+  cannot detect a flash reports exactly what a package that never flashes does.
+
+Measured 2026-10-11 on `win32-x64`, 8 spawn/kill cycles against 0.1.3: control
+detected a visible console; subject created 8 `PseudoConsoleWindow`s and showed
+**0**. Proven to go red, too — a deliberately flashing subject yields 6 visible
+shows and exit 1, per the sabotage rule above.
+
+Three traps in the probe itself, all found by the control rather than by
+reading documentation:
+
+- **An `OUTOFCONTEXT` WinEvent hook is delivered through the message queue of
+  the thread that INSTALLED it.** The first draft installed on the main thread
+  and pumped messages on a worker, captured zero events, and reported the
+  subject clean. That is the failure mode this whole file guards against, and it
+  appeared in the guard.
+- **The process must be on the interactive window station**, or it sees no
+  windows at all. `--sanity` counts what is already on the desktop and aborts.
+- **The cycle must KILL**, because #4 was a teardown flash. A spawn-only subject
+  does not exercise the half the issue was about.
+
+One honest limit: this runs on an interactive desktop, whereas #4 appeared under
+the **windowless detached service host**. The mechanism it rules out (a forked
+agent popping a window) is absent by architecture in either case, but the
+detached host is not what is being measured here. Say "no flash on the
+interactive desktop, instrument validated" rather than rounding it up.
 
 ### Three POSIX traps (`native/posix.rs`)
 
@@ -210,5 +257,10 @@ is written in, and it did not measure threads at all. See
 run — nothing in CI hosts them natively. Say "builds, unproven" for those two
 rather than rounding four green platforms up to six.
 
-Nothing has been published; the npm name does not exist yet, and the first
-publish is the one-time authenticated step only the owner can perform.
+**Published.** `@particle-academy/fancy-pty` is on npm — `0.1.3` is `latest` as
+of 2026-10-11, and CI publishes by tag over OIDC, so the owner-only bootstrap
+this paragraph used to describe is done. `fancy-term-host` consumes it as an
+optional dependency at `>=0.1.1 <2.0`, which means a consumer taking
+`fancy-term-host` resolves whatever the newest `0.1.x` is — so a release here
+reaches terminal users without them upgrading anything. Check what they actually
+resolve before claiming a fix has landed for them.

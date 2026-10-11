@@ -8,6 +8,36 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+### Added
+
+- **`npm run verify:flash` — a live Windows check that no console window ever
+  APPEARS during a spawn/kill cycle** (`fancy-term-host` #4), plus the probe it
+  runs on. No consumer-visible change; this measures a claim that was previously
+  only argued.
+
+  The claim was architectural and sound — this package ships no agent process,
+  so there is no second executable to pop a window the way node-pty's legacy
+  ConPTY agent did. But `fancy-term-host`'s 0.10.0-rc.1 notes said #4 was "in
+  the Windows VM acceptance set" and "re-proved rather than assumed", and when
+  that was checked against the acceptance record it was **not there** — the
+  smoke covered the window and the helper was spawned with `windowsHide`, but
+  nothing asserted "no console flashed" as its own control. A confident sentence
+  stood in for a measurement.
+
+  Measured now, on `win32-x64`, 8 spawn/kill cycles against 0.1.3: 8
+  `PseudoConsoleWindow`s created, **0 ever shown**. The discriminator is the
+  `EVENT_OBJECT_SHOW`, not the window — ConPTY creates one per pty regardless,
+  so counting windows would have produced a false positive on correct code.
+
+  `--verify` runs a **positive control first** and reports VOID rather than PASS
+  if the probe cannot see a console it opened itself: a flash lasts tens of
+  milliseconds, and an instrument that cannot catch one is indistinguishable
+  from a package that never flashes. Proven to go red as well — a deliberately
+  flashing subject gives 6 visible shows and exit 1.
+
+  Known limit, stated rather than rounded off: this runs on an interactive
+  desktop, while #4 appeared under the windowless detached service host.
+
 ## [0.1.3] - 2026-10-10
 
 ### Fixed
