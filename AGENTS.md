@@ -156,8 +156,8 @@ any machine — so the macOS CI job is where that arm is proven.
 **Working on four platforms, measured in CI on real runners** — 60 spawn/exit
 cycles each, every one against the live suite (real shell, the execution oracle,
 size reported back, resize, kill, failed spawn, orphan sweep), and each opening
-with the positive control that proves the gauges move at all (20 live ptys:
-libuv handles 12 -> 92 everywhere).
+with the positive control that proves the gauges move at all — 20 live ptys must
+move threads or handles before any "nothing retained" result is believed.
 
 | platform | per pty | threads | handles / fds | memory |
 |---|---|---|---|---|

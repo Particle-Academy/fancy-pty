@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
+import path from "node:path";
 
-import { helperPath, isSupported, platformKey } from "./helper-path.js";
+import { helperPath, isSupported, packageRoot, platformKey } from "./helper-path.js";
 import {
     FrameDecoder,
     Request,
@@ -67,12 +68,36 @@ export function open(options: PtyOptions): Pty {
     }
     if (!existsSync(exe)) {
         // Checked up front and named precisely, because the alternative is a
-        // spawn ENOENT that reads like the SHELL is missing. In a packaged app
-        // the real cause is almost always that `bin/` was swallowed by the asar
-        // archive, and a message that says so saves the whole investigation.
+        // spawn ENOENT that reads like the SHELL is missing.
+        //
+        // THREE causes, and they need three different answers — one message
+        // covering all of them would send two thirds of readers the wrong way.
+        // The `bin/` directory is `.gitignore`d on purpose (six per-platform
+        // binaries would make every clone carry five it cannot run), and the
+        // publish workflow assembles them from native runners. So an install
+        // from GIT or a source checkout has NO binaries at all, and blaming
+        // `asarUnpack` there would be a confidently wrong diagnosis.
+        const binRoot = path.join(packageRoot(), "bin");
+        const platforms = existsSync(binRoot) ? readdirSync(binRoot) : [];
+
+        if (platforms.length === 0) {
+            throw new Error(
+                `fancy-pty: no helper binaries are present (${binRoot} is empty or absent). ` +
+                    `bin/ is gitignored and the binaries are built per-platform at publish ` +
+                    `time, so a git or source install carries none: run 'npm run build:helper' ` +
+                    `in the package, or install it from the npm registry.`,
+            );
+        }
+        if (!platforms.includes(platformKey())) {
+            throw new Error(
+                `fancy-pty: no helper for ${platformKey()}. ` +
+                    `This install has: ${platforms.join(", ")}.`,
+            );
+        }
         throw new Error(
-            `fancy-pty: helper not found at ${exe}. In a packaged Electron app, ` +
-                `add '**/node_modules/@particle-academy/fancy-pty/bin/**' to asarUnpack — ` +
+            `fancy-pty: helper not found at ${exe}, though ${binRoot} has it. ` +
+                `In a packaged Electron app, add ` +
+                `'**/node_modules/@particle-academy/fancy-pty/bin/**' to asarUnpack — ` +
                 `a binary inside an asar archive has no path the OS can execute.`,
         );
     }

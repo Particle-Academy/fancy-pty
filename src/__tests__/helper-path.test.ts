@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
-import { SUPPORTED, helperFileName, helperPath, isSupported, platformKey } from "../helper-path.js";
+import {
+    SUPPORTED,
+    helperFileName,
+    helperPath,
+    isSupported,
+    packageRoot,
+    platformKey,
+} from "../helper-path.js";
 import { open } from "../pty.js";
 
 /**
@@ -64,14 +72,36 @@ describe("helper placement", () => {
 });
 
 describe("open() failure modes", () => {
-    it("names the asar cause when the helper is absent", () => {
-        // In a packaged Electron app the real cause is almost always that
-        // `bin/` was swallowed by the asar archive. A bare spawn ENOENT reads
-        // like the SHELL is missing and sends the reader to the wrong place
-        // entirely, so the message has to carry the diagnosis.
-        expect(() =>
-            open({ argv: ["cmd.exe"], helper: path.join("/nonexistent", "fancy-pty-helper") }),
-        ).toThrow(/asarUnpack/);
+    it("distinguishes 'installed from git' from 'swallowed by asar'", () => {
+        // THREE causes need three answers, and one message covering all of
+        // them sends two thirds of readers the wrong way.
+        //
+        // `bin/` is gitignored on purpose — six per-platform binaries would
+        // make every clone carry five it cannot run — and the publish workflow
+        // assembles them from native runners. So a GIT or source install has no
+        // binaries at all, and the asar diagnosis would be confidently wrong
+        // there: a reader would go hunting through electron-builder config for
+        // a problem that is simply "this install never had them".
+        //
+        // Which branch fires here depends on whether the local tree has been
+        // built, so both are accepted — what is asserted is that the message
+        // names the RIGHT cause for the state it is in, and never the asar one
+        // unless a binary for this platform really is present.
+        const binRoot = path.join(packageRoot(), "bin");
+        const built = existsSync(path.join(binRoot, platformKey()));
+
+        try {
+            open({ argv: ["cmd.exe"], helper: path.join(binRoot, "definitely-not-here") });
+            throw new Error("open() should have thrown");
+        } catch (e) {
+            const msg = (e as Error).message;
+            if (built) {
+                expect(msg).toMatch(/asarUnpack/);
+            } else {
+                expect(msg).toMatch(/gitignored|no helper for/);
+                expect(msg).not.toMatch(/asarUnpack/);
+            }
+        }
     });
 
     it("refuses an empty argv before spawning anything", () => {
