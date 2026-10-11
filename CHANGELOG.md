@@ -47,15 +47,21 @@ version number is not a stability promise until 1.0; read the entry.
   CLOEXEC errno pipe so a failed exec is reported rather than appearing as a
   shell that exited 127. Verified by the live suite on real CI runners:
 
-  | platform | per pty | retained / exited pty |
-  |---|---|---|
-  | `win32-x64` | 34 ms | 0.008 MB, 0.000 handles |
-  | `linux-x64` | 3 ms | 0.027 MB, 0.000 handles |
-  | `linux-arm64` | 3 ms | 0.031 MB, 0.000 handles |
-  | `darwin-arm64` | 10 ms | 0.046 MB, 0.000 handles |
+  | platform | per pty | threads | handles / fds | memory |
+  |---|---|---|---|---|
+  | `win32-x64` | 32 ms | 0.000 | 0.000 OS handles | 0.009 MB |
+  | `linux-x64` | 3 ms | 0.000 | 0.000 fds | 0.036 MB |
+  | `linux-arm64` | 2 ms | 0.000 | 0.000 fds | 0.021 MB |
+  | `darwin-arm64` | 12 ms | 0.000 | 0.000 fds | 0.044 MB |
 
   `darwin-x64` and `win32-arm64` cross-compile clean but have not run — nothing
   in CI hosts them natively, and "builds" is not "works".
+- **The leak check measures the bar's own units** — threads, OS handles/fds and
+  RSS (`test/live/process-stats.mjs`). An earlier version gauged `libuv` handle
+  counts, which are Node's event-loop handles rather than OS handles, and did
+  not measure threads at all; it reported a pass against a threshold it was not
+  measuring. An unavailable metric is now skipped out loud rather than scored
+  as zero.
 - `npm run lint` typechecks the helper for **all six** targets, not just the
   host. `c_char` is unsigned on `aarch64-linux` and signed elsewhere, so
   hardcoded `i8` C-string pointers compiled on four targets and failed on one;

@@ -94,15 +94,27 @@ Windows uses ConPTY; macOS and Linux use `posix_openpt` with
 
 Measured in CI on real runners, 60 spawn/exit cycles per platform:
 
-| platform | per pty | retained / exited pty |
-|---|---|---|
-| `win32-x64` | 34 ms | 0.008 MB, 0.000 handles |
-| `linux-x64` | 3 ms | 0.027 MB, 0.000 handles |
-| `linux-arm64` | 3 ms | 0.031 MB, 0.000 handles |
-| `darwin-arm64` | 10 ms | 0.046 MB, 0.000 handles |
+| platform | per pty | threads | handles / fds | memory |
+|---|---|---|---|---|
+| `win32-x64` | 32 ms | 0.000 | 0.000 OS handles | 0.009 MB |
+| `linux-x64` | 3 ms | 0.000 | 0.000 fds | 0.036 MB |
+| `linux-arm64` | 2 ms | 0.000 | 0.000 fds | 0.021 MB |
+| `darwin-arm64` | 12 ms | 0.000 | 0.000 fds | 0.044 MB |
 
-Against a bar of <= 0.5 MB and <= 1.0 handles per exited pty. `darwin-x64` and
-`win32-arm64` cross-compile clean but have not run natively anywhere.
+Against a bar of **<= 0.1 threads, <= 1.0 handles and <= 0.5 MB** per exited
+pty. `darwin-x64` and `win32-arm64` cross-compile clean but have not run
+natively anywhere.
+
+Against the engine this replaces, measured by `claude · tynn` on a clean
+Windows 11 VM the same day — `node-pty` 1.x on ConPTY, in-process, 120 cycles:
+**1.067 threads, 18.27 handles and 13.303 MB retained per exited pty, at 3.3 s
+per spawn.** All three thresholds go red against it, which is what makes them
+worth asserting. (The spawn times are not comparable across boxes: theirs is a
+2-vCPU VM and these are CI runners.)
+
+Note `threads` in particular: the host process gains **no thread per pty**,
+because the threads live in the helper processes. `node-pty` creates about two
+per live pty inside the host and retains one of them per exited pty.
 
 This is **not** a terminal emulator. It moves bytes and owns process lifetime;
 rendering belongs to [`fancy-term`](https://github.com/Particle-Academy/fancy-term).

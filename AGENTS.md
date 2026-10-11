@@ -159,16 +159,28 @@ size reported back, resize, kill, failed spawn, orphan sweep), and each opening
 with the positive control that proves the gauges move at all (20 live ptys:
 libuv handles 12 -> 92 everywhere).
 
-| platform | per pty | retained / exited pty |
-|---|---|---|
-| `win32-x64` | 34 ms | 0.008 MB, 0.000 handles |
-| `linux-x64` | 3 ms | 0.027 MB, 0.000 handles |
-| `linux-arm64` | 3 ms | 0.031 MB, 0.000 handles |
-| `darwin-arm64` | 10 ms | 0.046 MB, 0.000 handles |
+| platform | per pty | threads | handles / fds | memory |
+|---|---|---|---|---|
+| `win32-x64` | 32 ms | 0.000 | 0.000 OS handles | 0.009 MB |
+| `linux-x64` | 3 ms | 0.000 | 0.000 fds | 0.036 MB |
+| `linux-arm64` | 2 ms | 0.000 | 0.000 fds | 0.021 MB |
+| `darwin-arm64` | 12 ms | 0.000 | 0.000 fds | 0.044 MB |
 
-The bar is <= 0.5 MB and <= 1.0 handles per exited pty. The worst platform is
-**11x under** the memory threshold and **zero** on handles, against an incident
-that retained ~12 MB and ~11 handles per exited pty.
+The bar is all three, per exited pty: **<= 0.1 threads, <= 1.0 handles,
+<= 0.5 MB**.
+
+Against the engine this replaces, measured by `claude · tynn` on a clean
+Windows 11 VM the same day — `node-pty` 1.x on ConPTY, in-process, 120 cycles:
+**1.067 threads, 18.27 handles and 13.303 MB retained per exited pty, at 3.3 s
+per spawn.** All three thresholds go red against it, which is what makes them
+worth asserting. (The spawn times are not comparable across boxes: theirs is a
+2-vCPU VM and these are CI runners.)
+
+**An earlier version of this table was in the wrong units and the numbers here
+replace it.** It reported `libuv` handle counts — Node's event-loop handles,
+about four per spawned child — as though they were the OS handle counts the bar
+is written in, and it did not measure threads at all. See
+`test/live/process-stats.mjs`; that is the whole reason the file exists.
 
 `darwin-x64` and `win32-arm64` are cross-compiled and build clean, but have not
 run — nothing in CI hosts them natively. Say "builds, unproven" for those two
