@@ -28,6 +28,7 @@
     "files": [
         "dist",
         "bin",
+        "!bin/**/*.pdb",
         "native",
         "README.md",
         "LICENSE",

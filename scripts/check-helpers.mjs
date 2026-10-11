@@ -18,6 +18,39 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+/**
+ * THE ONE EXEMPTION: the `0.0.0` bootstrap claim.
+ *
+ * npm's OIDC publishing can only publish to a name that already EXISTS, so the
+ * first publish of a new name has to come from an authenticated human on a
+ * laptop — where, by construction, five of the six per-platform binaries do not
+ * exist, because CI builds them on five other machines.
+ *
+ * So this gate — written to stop a real release shipping missing or wrong-arch
+ * binaries — blocked the only publish that legitimately has none, and it
+ * blocked it with a message about shipping broken installers. The owner hit it
+ * on the first command of a handover I wrote. The gate was right about releases
+ * and wrong about bootstraps, and it could not tell them apart.
+ *
+ * `0.0.0` is the narrowest possible carve-out: it is a name claim, never
+ * installed by anyone, and it can only ever happen once per package. Every
+ * other version still faces the full check.
+ *
+ * I should have caught this before handing over steps. `npm publish --dry-run`
+ * runs `prepublishOnly`, so one dry run would have failed here instead of in
+ * the owner's terminal.
+ */
+const version = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).version;
+if (version === "0.0.0") {
+    console.log(
+        "BOOTSTRAP CLAIM (version 0.0.0): skipping the architecture gate.\n" +
+            "  This version deliberately ships NO helper binaries — it exists only to\n" +
+            "  claim the npm name so a Trusted Publisher can be attached to it. It must\n" +
+            "  never be installed. Every other version faces the full check.\n",
+    );
+    process.exit(0);
+}
+
 const EXPECTED = {
     "win32-x64": { kind: "pe", machine: 0x8664 },
     "win32-arm64": { kind: "pe", machine: 0xaa64 },
