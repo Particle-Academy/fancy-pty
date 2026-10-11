@@ -51,9 +51,25 @@ export function processStats(pid = process.pid) {
         // below handles — so bare `.Count` is correct for this call, and
         // `@(...)` would only add a way to be wrong.
         //
-        // Flagged back to tynn: their failure shape must be something else
-        // (pwsh 7, StrictMode, or a differently-assigned pipeline) and worth
-        // pinning before applying the wrap everywhere.
+        // CAUSE, pinned by tynn and reproduced here on 5.1.26100.9444 — it is
+        // **Windows PowerShell 5.1's PSObject bug: `.Count` on a
+        // `[pscustomobject]` is `$null`** (fixed in PS 6). Not a one-element
+        // result, which is what the symptom looked like. Their registry lister
+        // emits custom objects; `Get-Process` emits real .NET objects, which is
+        // why the same expression answers correctly here and empty there.
+        //
+        // The precise rule, now that both halves are measured:
+        //
+        //   @(Function-Call)  GOOD — wraps the output STREAM, so zero results
+        //                     give a genuine empty array and `.Count` is 0
+        //   @($variable)      BAD  — `@($null).Count` is 1, inventing a count
+        //   bare .Count       fine for $null and for process objects;
+        //                     PSCustomObject is the broken case
+        //
+        // Kept as a worked example of why a remedy gets verified before it is
+        // adopted: the first diagnosis of this ("a one-element result") would
+        // have sent the wrap to every call site, including the ones where it is
+        // the thing that breaks them.
         try {
             const out = execFileSync(
                 "powershell",
