@@ -8,6 +8,7 @@ export {
     isSupported,
     packageRoot,
     platformKey,
+    unpackedPath,
 } from "./helper-path.js";
 
 export {

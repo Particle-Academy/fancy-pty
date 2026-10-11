@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 
-import { helperPath, isSupported, packageRoot, platformKey } from "./helper-path.js";
+import { helperPath, isSupported, packageRoot, platformKey, unpackedPath } from "./helper-path.js";
 import {
     FrameDecoder,
     Request,
@@ -77,7 +77,12 @@ export function open(options: PtyOptions): Pty {
         // publish workflow assembles them from native runners. So an install
         // from GIT or a source checkout has NO binaries at all, and blaming
         // `asarUnpack` there would be a confidently wrong diagnosis.
-        const binRoot = path.join(packageRoot(), "bin");
+        // `unpackedPath` here too, or this diagnostic lies in an Electron app:
+        // `packageRoot()` resolves inside `app.asar` and the real `bin/` is in
+        // `app.asar.unpacked`. Reading the archive path through Electron's
+        // PATCHED `fs` can even succeed, so an un-rewritten binRoot produces a
+        // confident message about the wrong directory.
+        const binRoot = unpackedPath(path.join(packageRoot(), "bin"));
         const platforms = existsSync(binRoot) ? readdirSync(binRoot) : [];
 
         if (platforms.length === 0) {
@@ -94,11 +99,17 @@ export function open(options: PtyOptions): Pty {
                     `This install has: ${platforms.join(", ")}.`,
             );
         }
+        // Only now is asarUnpack a fair accusation: the per-platform directory
+        // exists and this exact file does not. Said carefully, because an
+        // earlier version offered this advice for a problem the consumer did
+        // not have — their `asarUnpack` was correct and the path we BUILT named
+        // the archive instead of the unpacked tree.
         throw new Error(
-            `fancy-pty: helper not found at ${exe}, though ${binRoot} has it. ` +
-                `In a packaged Electron app, add ` +
-                `'**/node_modules/@particle-academy/fancy-pty/bin/**' to asarUnpack — ` +
-                `a binary inside an asar archive has no path the OS can execute.`,
+            `fancy-pty: helper not found at ${exe}, though ${binRoot} exists. ` +
+                `If this is a packaged Electron app, check that ` +
+                `'**/node_modules/@particle-academy/fancy-pty/bin/**' is in asarUnpack — ` +
+                `a binary inside an asar archive has no path the OS can execute, and ` +
+                `child_process.spawn is not redirected the way fs reads are.`,
         );
     }
 

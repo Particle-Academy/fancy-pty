@@ -62,6 +62,40 @@ export function packageRoot(): string {
 }
 
 /**
+ * Rewrite a path inside an Electron asar archive to its unpacked twin.
+ *
+ * THE BUG THIS FIXES, found by `claude · tynn` on an INSTALLED app and not
+ * reproducible from an unpacked tree: inside Electron this module lives at
+ * `…/resources/app.asar/node_modules/@particle-academy/fancy-pty/…`, so
+ * `packageRoot()` resolves into the archive and the helper path points inside
+ * it. The executable is genuinely on disk — `asarUnpack` put it at
+ * `…/resources/app.asar.unpacked/node_modules/…/bin/<platform>-<arch>/` — but
+ * the path we built names the archive.
+ *
+ * **Electron patches `fs` to redirect reads of unpacked files; it does NOT
+ * patch `child_process.spawn`.** So the pre-flight `existsSync` SUCCEEDS
+ * through the patched `fs` and the spawn then fails on a path the OS cannot
+ * execute. A terminal returns `pid -1`, no helper process ever appears, and the
+ * consumer's config was correct the whole time — which is why the error message
+ * telling them to add `asarUnpack` was advice for a problem they did not have.
+ *
+ * `node-pty` never hit this because its whole package is unpacked and its
+ * `.node` loads through `process.dlopen`, which Electron *does* patch.
+ *
+ * Any segment ending `.asar` is rewritten, not just `app.asar`: Electron allows
+ * arbitrarily named archives, and `asarUnpack` always produces
+ * `<name>.asar.unpacked`. A path already containing `.asar.unpacked` is left
+ * alone — the match is anchored to the segment end, so it cannot double-apply.
+ */
+export function unpackedPath(p: string): string {
+    const sep = path.sep;
+    return p
+        .split(sep)
+        .map((segment) => (/\.asar$/i.test(segment) ? `${segment}.unpacked` : segment))
+        .join(sep);
+}
+
+/**
  * Absolute path to the helper for a platform/arch.
  *
  * @param options.dir escape hatch for a consumer whose packager puts `bin/`
@@ -74,7 +108,11 @@ export function helperPath(
     const platform = options.platform ?? process.platform;
     const arch = options.arch ?? process.arch;
     const dir = options.dir ?? path.join(packageRoot(), "bin", platformKey(platform, arch));
-    return path.join(dir, helperFileName(platform));
+    // The asar rewrite applies to the DEFAULT path only. An explicit `dir` is
+    // the consumer's own claim about where the binary is, and silently
+    // rewriting it would make their override mean something they did not say.
+    const resolved = options.dir ? path.join(dir, helperFileName(platform)) : unpackedPath(path.join(dir, helperFileName(platform)));
+    return resolved;
 }
 
 /** Platform/arch pairs this package ships a helper for. */

@@ -8,6 +8,45 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-10
+
+### Fixed
+
+- **The helper could not be spawned from inside a packaged Electron app.** This
+  is the one that mattered: in a packaged app the module lives at
+  `resources/app.asar/node_modules/@particle-academy/fancy-pty/`, so
+  `packageRoot()` resolved INTO the archive and the helper path named the
+  archive — while the executable sat correctly on disk under
+  `resources/app.asar.unpacked/.../bin/<platform>-<arch>/`.
+
+  **Electron patches `fs` to redirect reads of unpacked files; it does not patch
+  `child_process.spawn`.** So the pre-flight `existsSync` SUCCEEDED and the
+  spawn then failed on a path the OS cannot execute. A terminal came back
+  `pid -1`, no helper process ever appeared, and the error message blamed
+  `asarUnpack` — advice for a problem the consumer did not have, since their
+  `asarUnpack` was correct.
+
+  Any path segment ending `.asar` is now rewritten to `.asar.unpacked`
+  (exported as `unpackedPath`). Not just `app.asar`: Electron allows
+  arbitrarily named archives and `asarUnpack` always produces
+  `<name>.asar.unpacked`, so hardcoding the common name would have fixed it for
+  the reporter and nobody else. The match is anchored to the segment end, so it
+  is idempotent and leaves `app.asar.unpacked` and `my.asar.backup` alone.
+
+  `node-pty` never hit this because its whole package is unpacked and its
+  `.node` loads through `process.dlopen`, which Electron *does* patch.
+
+  Found by `claude · tynn` on an INSTALLED build. **Nothing in this repo could
+  have caught it**: the live suite, 21 unit tests and all six CI targets were
+  green throughout, because every one of them runs from an unpacked tree.
+  Packaging is a different environment rather than a different configuration.
+  `src/__tests__/asar.test.ts` is the cheapest stand-in — the rewrite is pure
+  string work, so it needs no Electron, no build and no installer.
+
+  An explicit `helperPath({ dir })` is deliberately NOT rewritten: that is the
+  consumer's own claim about where the binary is, and silently changing it would
+  make their override mean something they did not say.
+
 ### Added
 
 - **The live suite asserts issue #4 directly: the pty's console exists but is
