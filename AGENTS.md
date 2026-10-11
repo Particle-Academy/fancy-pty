@@ -169,12 +169,36 @@ move threads or handles before any "nothing retained" result is believed.
 The bar is all three, per exited pty: **<= 0.1 threads, <= 1.0 handles,
 <= 0.5 MB**.
 
-Against the engine this replaces, measured by `claude · tynn` on a clean
-Windows 11 VM the same day — `node-pty` 1.x on ConPTY, in-process, 120 cycles:
-**1.067 threads, 18.27 handles and 13.303 MB retained per exited pty, at 3.3 s
-per spawn.** All three thresholds go red against it, which is what makes them
-worth asserting. (The spawn times are not comparable across boxes: theirs is a
-2-vCPU VM and these are CI runners.)
+### The same-VM comparison, which is the only rigorous one
+
+Measured by `claude · tynn` in `genie-test-windows`, **both engines in the same
+VM on the same workload** — 120 open/exit cycles, and 20 held open as a positive
+control. Earlier figures in this file were from different machines and are not
+comparable; these are.
+
+| per exited pty | `node-pty` 1.x | `fancy-pty` 0.1.1 |
+|---|---|---|
+| threads | 1.07 | **0.000** |
+| handles | 18.3 | **0.00** |
+| memory | 13.3 MB | **0.011 MB** |
+| 20 live ptys | **+40 threads** | **+0 threads** |
+
+Threads and handles are not reduced, they are **eliminated** — zero, not a
+smaller number. Memory is over a thousandfold lower, and `0.011 MB` is near the
+floor of what the gauge resolves rather than a measured plateau, so read it as
+"nothing detectable" rather than as a precise figure.
+
+**The `+0 threads` row is the architecture showing up in an instrument.**
+node-pty puts roughly two threads per live pty *inside the host process* and
+keeps one of them after the pty exits. fancy-pty's threads live in the per-pty
+helper, so the host gains none and an exited terminal cannot leave one behind.
+That is a property of the shape, not a promise about the code.
+
+Also green in that VM on this engine: `verify:terminal` 8/8, 650 unit tests, the
+window smoke 1–40 on an installed build including typing into a real terminal,
+and the live "agents hold no pty" scan 12/12 — a terminal is exactly one
+headless conhost (0 → 1 → 0) and a running agent adds none. Linux (WSL2) ran the
+same set green.
 
 **An earlier version of this table was in the wrong units and the numbers here
 replace it.** It reported `libuv` handle counts — Node's event-loop handles,
