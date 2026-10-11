@@ -34,6 +34,26 @@ export function processStats(pid = process.pid) {
     if (process.platform === "win32") {
         // One PowerShell call for both, because two would sample different
         // instants and the arithmetic downstream subtracts them.
+        //
+        // `.Count` IS USED BARE HERE, DELIBERATELY. `claude · tynn` hit a
+        // Windows VM where `.Count` on a one-element PowerShell result read
+        // empty, twice, and their remedy is `@(...)` at every call site. I
+        // measured both forms before adopting it on Win11 PS 5.1.26100.9444:
+        //
+        //   bare .Count          0 results -> 0,  1 -> 1,  many -> 32   correct
+        //   @(...).Count         0 results -> 0,  1 -> 1,  many -> 32   correct
+        //   BUT  @($null).Count  -> 1                                   WRONG
+        //
+        // So the blanket remedy is not free: wrapping a value that can be
+        // `$null` turns "nothing" into "one thing". For a count of orphaned
+        // processes that is a false positive invented by the fix. `Get-Process
+        // -Id <pid>` cannot return null without throwing — which the catch
+        // below handles — so bare `.Count` is correct for this call, and
+        // `@(...)` would only add a way to be wrong.
+        //
+        // Flagged back to tynn: their failure shape must be something else
+        // (pwsh 7, StrictMode, or a differently-assigned pipeline) and worth
+        // pinning before applying the wrap everywhere.
         try {
             const out = execFileSync(
                 "powershell",
