@@ -1,6 +1,6 @@
 {
     "name": "@particle-academy/fancy-pty",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Zero-dependency pseudo-terminal for Node: a tiny native helper executable plus pure JS. No native addon, no node-gyp, no node-addon-api, no Electron ABI rebuild, no prebuilds to resolve.",
     "repository": {
         "type": "git",

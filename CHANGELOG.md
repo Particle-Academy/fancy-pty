@@ -8,6 +8,25 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-10
+
+### Changed
+
+- **The helper binaries are stripped, cutting the package from 13.64 MB to a
+  fraction of it.** Measured from the published 0.1.0 tarball: the Linux
+  helpers were **5.60 MB and 5.48 MB** against Windows' 0.30 MB — 18x — because
+  ELF and Mach-O carry debug symbols INSIDE the binary where Windows puts them
+  in a separate `.pdb`, which was already excluded. Built with
+  `-C strip=symbols`.
+
+  Nothing a consumer does changes. The trade is that a crash backtrace loses
+  function names; panic messages keep their file and line regardless, since
+  those compile in as static strings, and this is ~700 lines of straight-line
+  syscalls with no recursion.
+
+  It took shipping 0.1.0 to see this: the arch gate checks the binaries are
+  *correct*, and had no opinion on whether they were *fat*.
+
 ## [0.1.0] - 2026-10-10
 
 ### Added

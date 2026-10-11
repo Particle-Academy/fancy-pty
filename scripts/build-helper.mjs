@@ -70,6 +70,20 @@ const args = [
     // investigation. A static binary cannot have that failure.
     "-C",
     "target-feature=+crt-static",
+    // Strip the symbol table. MEASURED, from the published 0.1.0 tarball:
+    // unstripped, the Linux helpers were **5.60 MB and 5.48 MB** against
+    // Windows' 0.30 MB — 18x, because ELF and Mach-O carry debug symbols INSIDE
+    // the binary where Windows puts them in a separate `.pdb` (which is already
+    // excluded from the tarball). That made the package 13.64 MB unpacked, in
+    // every consumer's node_modules, for a PTY layer.
+    //
+    // The trade, stated rather than assumed: a crash backtrace loses function
+    // names. Panic messages keep their file and line regardless — those are
+    // compiled in as static strings — and this is ~700 lines of straight-line
+    // syscalls with no recursion, so a named backtrace was never going to be
+    // the thing that diagnosed it. Consistent with dropping the pdb.
+    "-C",
+    "strip=symbols",
     "--target",
     triple,
     path.join(root, "native", "helper.rs"),
