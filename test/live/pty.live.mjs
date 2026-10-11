@@ -313,6 +313,61 @@ console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
     ok(perMb <= 0.5, `retained <= 0.5 MB per exited pty (${perMb.toFixed(3)})`);
 }
 
+// ------------------------------------ 7b. issue #4: no VISIBLE console window
+if (isWindows) {
+    console.log("\n7b. the pty's console exists but is NOT VISIBLE (issue #4)");
+
+    // WHY THIS IS HERE AND NOT IN A VM SMOKE TEST. `claude · tynn`'s Windows
+    // acceptance runs headless over CDP in session 0, so "no window appeared"
+    // is not something that VM can observe, and they said so rather than
+    // claiming it. This closes the gap from the other direction: the CHILD
+    // reports its own console's visibility from inside the pty, which needs no
+    // desktop, no session and nobody looking at a screen — and it is checked on
+    // every run rather than once by eye.
+    //
+    // Issue #4 was a stray visible console per shell under a windowless
+    // detached host, plus a kill path that forked an un-hidden agent. fancy-pty
+    // ships no agent, so only the first half is even expressible, and this is
+    // the assertion for it.
+    //
+    // NOTE THE SHAPE OF THE ASSERTION, because the obvious version is wrong: a
+    // ConPTY child ALWAYS has a non-null console HWND — conhost creates a window
+    // and never shows it. So non-null is correct and expected; VISIBLE is the
+    // failure. An earlier probe of mine asserted non-null was the bug and
+    // invented one for a minute.
+    const ps = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Add-Type -Namespace W -Name N -MemberDefinition '" +
+            '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();' +
+            '[DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr h);' +
+            "'; $h = [W.N]::GetConsoleWindow(); " +
+            '"HWND=$h VISIBLE=$([W.N]::IsWindowVisible($h))"; exit',
+    ];
+
+    const probe = open({ argv: ps, cols: 90, rows: 30, env: process.env });
+    const pc = collect(probe);
+    await withTimeout(pc.exit, 30000);
+    const report = pc
+        .text()
+        // Strip CSI sequences and OSC strings so the match sees the text
+        // the shell printed rather than the terminal control around it.
+        .replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07/g, "")
+        .match(/HWND=(\S+)\s+VISIBLE=(\w+)/);
+
+    ok(report !== null, `the child reported its console state (${pc.text().slice(-60).trim()})`);
+    if (report) {
+        const [, hwnd, visible] = report;
+        ok(hwnd !== "0", `the child HAS a console (HWND ${hwnd}) — expected, conhost always makes one`);
+        ok(
+            visible.toLowerCase() === "false",
+            `and that console is NOT VISIBLE (IsWindowVisible=${visible}) — issue #4 absent`,
+        );
+    }
+}
+
 // ------------------------------------------------------- 8. no orphans
 console.log("\n8. nothing survives the run");
 {

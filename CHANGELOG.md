@@ -8,6 +8,24 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+### Added
+
+- **The live suite asserts issue #4 directly: the pty's console exists but is
+  NOT VISIBLE.** The child reports its own `GetConsoleWindow` /
+  `IsWindowVisible` from inside the pty, so the check needs no desktop, no
+  interactive session and nobody watching a screen — and it runs on every
+  Windows CI pass rather than once by eye.
+
+  It closes a gap `claude · tynn` named honestly in their Windows VM
+  acceptance: that run is headless over CDP in session 0, so "no window
+  appeared" is not something the VM can observe. This checks the same fact from
+  inside the process instead.
+
+  Note the shape, because the obvious assertion is wrong: a ConPTY child ALWAYS
+  has a non-null console HWND, since conhost creates a window and never shows
+  it. Non-null is correct and expected; VISIBLE is the failure. An earlier probe
+  asserted non-null was the bug and invented one.
+
 ## [0.1.1] - 2026-10-10
 
 ### Changed
