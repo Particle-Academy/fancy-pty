@@ -8,6 +8,45 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-10
+
+### Fixed
+
+- **A spawn failure is now visible to the HOST, not only to a terminal that may
+  not exist** (#1). `onError` was the only channel, and `fancy-term-host`
+  forwards it into the terminal data stream — correct for a pty that opened and
+  then broke, useless for one that never opened. In a packaged Electron app the
+  0.1.2 asar bug therefore left `pid -1` and nothing else; it was diagnosed from
+  the *shape* of the failure rather than from anything this package said.
+
+  An `error` with **no registered listener** now also goes to `process.stderr`,
+  which is Node's own convention for an unhandled `error`: do not swallow it.
+  It deliberately does **not** throw the way `EventEmitter` does — crashing an
+  Electron main process over one failed terminal is worse than a loud line —
+  and the check happens at **emit** time, not at `open()` time, so a caller that
+  registers `onError` on the line after `open()` is never second-guessed and
+  never printed over.
+
+  This changes nothing a caller can observe except that a fault nobody listened
+  for becomes visible. The alternatives all altered `open()`'s synchronous,
+  node-pty-shaped contract, which exists so consumers need no adapter change.
+
+- **A synchronous spawn failure now names the package and the path.** `spawn`
+  fails two different ways, measured rather than assumed: a directory or a
+  nonexistent path emits an **async** `error` (ENOENT), while a non-executable
+  *file* **throws synchronously** (EFTYPE on Windows). The sync half already
+  reached the caller, but as a bare `spawn EFTYPE` naming neither this package
+  nor the file — and whoever reads that is debugging someone else's library.
+
+### Added
+
+- `src/__tests__/unheard-error.test.ts`. Its fixture is a **directory**, which
+  is the only construct that reproduces the real shape: the `existsSync`
+  pre-flight PASSES and the spawn then fails asynchronously — exactly what the
+  asar bug did, where Electron's patched `fs` said yes and the unpatched
+  `spawn` said no. The first draft used a `.ts` file and failed for the wrong
+  reason, which is how the two failure modes came to be measured.
+
 ## [0.1.2] - 2026-10-10
 
 ### Fixed

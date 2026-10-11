@@ -113,14 +113,34 @@ export function open(options: PtyOptions): Pty {
         );
     }
 
-    const child: ChildProcess = spawn(exe, [], {
-        // The helper's own stdio IS the protocol: stdin carries control frames,
-        // stdout carries pty output, and stderr stays human-readable so a
-        // helper that dies badly can still say why without corrupting the
-        // stream the consumer is parsing.
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-    });
+    /**
+     * `spawn` fails two different ways and only one of them is an event.
+     *
+     * Measured: a DIRECTORY or a nonexistent path emits an async `error`
+     * (ENOENT); a non-executable FILE throws SYNCHRONOUSLY (EFTYPE on
+     * Windows). The async half is handled by `onError` plus the unheard-error
+     * fallback below. The sync half propagates to the caller already — but as
+     * a bare `spawn EFTYPE` naming neither this package nor the path, and the
+     * person reading it is debugging someone else's library.
+     */
+    let child: ChildProcess;
+    try {
+        child = spawn(exe, [], {
+            // The helper's own stdio IS the protocol: stdin carries control
+            // frames, stdout carries pty output, and stderr stays
+            // human-readable so a helper that dies badly can still say why
+            // without corrupting the stream the consumer is parsing.
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+        });
+    } catch (e) {
+        const err = e as NodeJS.ErrnoException;
+        throw new Error(
+            `fancy-pty: could not start the helper at ${exe} (${err.code ?? err.message}). ` +
+                `The file exists but is not an executable image for this platform.`,
+            { cause: e },
+        );
+    }
 
     const listeners: {
         data: ((c: Buffer) => void)[];
@@ -132,6 +152,37 @@ export function open(options: PtyOptions): Pty {
         what: K,
         arg: Parameters<(typeof listeners)[K][number]>[0],
     ): void => {
+        /**
+         * AN UNHEARD `error` GOES TO stderr. (#1)
+         *
+         * A spawn failure is the most diagnosable moment this package has and
+         * it had the worst reporting: `onError` is the only channel, and
+         * `fancy-term-host` forwards it into the TERMINAL stream — correct for
+         * a pty that opened and then broke, useless for one that never opened,
+         * because there is no terminal to render into. In a packaged Electron
+         * app that left `pid -1` and nothing else; `claude · tynn` diagnosed
+         * the asar bug from the SHAPE of the failure rather than from anything
+         * this library said.
+         *
+         * This is Node's own convention for an unhandled `error`: do not
+         * swallow it. It deliberately does NOT throw the way EventEmitter does
+         * — crashing an Electron main process over one failed terminal is worse
+         * than a loud line — and it checks at EMIT time, not at `open()` time,
+         * so a caller that registers `onError` immediately after `open()`
+         * returns is never second-guessed.
+         *
+         * The alternative fixes all changed `open()`'s contract, which is
+         * deliberately node-pty-shaped so consumers need no adapter change.
+         * This one changes nothing a caller can observe except that a fault
+         * nobody listened for becomes visible.
+         */
+        if (what === "error" && listeners.error.length === 0) {
+            const err = arg as Error;
+            process.stderr.write(
+                `[fancy-pty] unhandled error (no onError listener): ${err?.message ?? String(arg)}\n`,
+            );
+        }
+
         for (const fn of listeners[what] as ((a: unknown) => void)[]) {
             try {
                 fn(arg);
