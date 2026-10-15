@@ -233,7 +233,22 @@ export function open(options: PtyOptions): Pty {
         stderrText += c.toString("utf8");
     });
 
-    child.on("error", (e) => emit("error", e));
+    /**
+     * The async half of a failed spawn names the package and the path too. On
+     * POSIX a non-executable file is NOT a synchronous throw (that is Windows'
+     * EFTYPE) but an `error` event (EACCES), and a missing path is ENOENT on
+     * every platform; before `spawn` fires, such an error is "could not start
+     * the helper", worded like the synchronous one. After it, an error is the
+     * running helper's and passes through as it is.
+     */
+    let started = false;
+    child.once("spawn", () => {
+        started = true;
+    });
+    child.on("error", (e: NodeJS.ErrnoException) => {
+        if (started) return emit("error", e);
+        emit("error", new Error(`fancy-pty: could not start the helper at ${exe} (${e.code ?? e.message}).`, { cause: e }));
+    });
 
     /**
      * THE HELPER'S STDIN HAS AN `error` LISTENER — a write to a helper that is

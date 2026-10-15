@@ -34,6 +34,17 @@ version number is not a stability promise until 1.0; read the entry.
   that a plain write gets `EPIPE`; the check counts uncaught exceptions. It is red
   on 0.1.3 (`[ 'write EPIPE' ]`) and green with the fix, run in a Linux VM.
 
+- **A helper that cannot start now names fancy-pty and its path on every
+  platform, not only on Windows.** A non-executable helper is a synchronous
+  throw on Windows (EFTYPE), which 0.1.0 already wrapped. On POSIX it is an
+  `error` event (EACCES), and a missing path is ENOENT everywhere. Those arrived
+  as a bare `spawn EACCES` naming neither the package nor the file. An error
+  before the helper's `spawn` event is now worded "fancy-pty: could not start
+  the helper at <path> (<code>)", with the original as `cause`. After `spawn`,
+  errors pass through unchanged. The test that covered this asserted only the
+  Windows half, so it was red on the Linux CI runner for 0.1.3. It now asserts
+  the same promise on every platform.
+
 ### Added
 
 - **`npm run verify:flash` — a live Windows check that no console window ever
