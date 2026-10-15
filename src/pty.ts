@@ -236,6 +236,36 @@ export function open(options: PtyOptions): Pty {
     child.on("error", (e) => emit("error", e));
 
     /**
+     * THE HELPER'S STDIN HAS AN `error` LISTENER — a write to a helper that is
+     * already gone must never become an uncaught exception.
+     *
+     * Measured on the installed Genie 2 (genie-test-ubuntu, 2026-10-15): the
+     * front door's Caddy, an unprivileged process, could not bind its port,
+     * said so, and exited; the helper
+     * forwarded those words as a Data frame and exited too. Genie read the words
+     * and asked for a stop — `kill()` — in the same tick, BEFORE the Exit frame
+     * or `close` had been processed, so `exited` was still false and `send`
+     * wrote the Kill frame into a pipe whose reader was dead. Node reports that
+     * write's EPIPE asynchronously, as an `error` EVENT on `child.stdin`; with no
+     * listener it is thrown from `process.nextTick`. In Electron that is the
+     * main-process "A JavaScript error occurred" box — a synchronous GTK
+     * dialog (`gtk_dialog_run`) on the main thread. Genie's window, its
+     * DevTools endpoint and every agent and site it supervises stopped
+     * answering until someone clicked a box nobody could see.
+     *
+     * The `exited`/`writable` guard in `send` cannot close this: the reader's
+     * death is only known from the write that fails. So the error is HEARD:
+     * EPIPE (and a write to an already-destroyed stream) means the helper is
+     * gone, which `close` — or the Exit frame — reports with what actually
+     * happened; anything else is a real fault and goes to `onError` like every
+     * other one (and to stderr when nobody listens, #1). Never a throw.
+     */
+    child.stdin?.on("error", (e: NodeJS.ErrnoException) => {
+        if (e.code === "EPIPE" || e.code === "ERR_STREAM_DESTROYED") return;
+        emit("error", e);
+    });
+
+    /**
      * Two independent signals for one event, deliberately.
      *
      * If the helper dies without emitting EXIT — a crash, a SIGKILL, a

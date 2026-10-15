@@ -8,6 +8,32 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-15
+
+### Fixed
+
+- **A write to a helper that has already exited no longer throws an uncaught
+  `EPIPE`.** `kill()` (or `write`/`resize`) in the window between the helper's
+  death and the `close` event wrote into a pipe whose reader was gone. Node
+  reports that as an `error` event on the helper's stdin, which had no listener,
+  so it was thrown from `process.nextTick`. In Electron that is the main-process
+  "A JavaScript error occurred" dialog, a synchronous GTK dialog on the main
+  thread: measured in Genie 2 on Linux, where a front-door Caddy that could not
+  bind its port exited and Genie's immediate stop hit the window. Genie froze
+  behind a dialog nobody could see.
+
+  The helper's stdin now has an `error` listener. `EPIPE` and
+  `ERR_STREAM_DESTROYED` mean the helper is gone, which `close` (or the Exit
+  frame) already reports with what actually happened, so they are dropped. Any
+  other stdin error goes to `onError` like every other fault (and to stderr when
+  nobody listens, #1). Nothing is thrown. A caller observes no change except
+  that the crash is gone.
+
+  Test: `src/__tests__/stdin-epipe.test.ts` uses a helper that closes its stdin
+  and stays alive, so the window is reproduced every run. Its control first shows
+  that a plain write gets `EPIPE`; the check counts uncaught exceptions. It is red
+  on 0.1.3 (`[ 'write EPIPE' ]`) and green with the fix, run in a Linux VM.
+
 ### Added
 
 - **`npm run verify:flash` — a live Windows check that no console window ever
