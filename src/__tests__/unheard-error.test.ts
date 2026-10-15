@@ -125,16 +125,22 @@ describe("an unheard error reaches stderr", () => {
     });
 });
 
-describe("a SYNCHRONOUS spawn failure names the package", () => {
-    it("wraps the raw errno so the message says what failed and where", () => {
-        // A non-executable FILE throws out of spawn synchronously, which the
-        // caller already sees — but as a bare `spawn EFTYPE` with no mention of
-        // fancy-pty or the path. Wrapped, because the reader of that message is
-        // debugging someone else's library.
+describe("a spawn failure names the package, on every platform", () => {
+    it("wraps the raw errno so the message says what failed and where — thrown (Windows) or as the error (POSIX)", async () => {
+        // A non-executable FILE throws out of spawn synchronously on Windows
+        // (EFTYPE) but arrives as an `error` EVENT on POSIX (EACCES) — the CI
+        // runner is Linux, and this test used to assert only the Windows half,
+        // so it was red there on 0.1.3. Either way the caller used to see a bare
+        // errno with no mention of fancy-pty or the path. Wrapped, because the
+        // reader of that message is debugging someone else's library.
         const notExecutable = path.join(__dirname, "unheard-error.test.ts");
         let message = "";
         try {
-            open({ argv: ["irrelevant"], helper: notExecutable });
+            const pty = open({ argv: ["irrelevant"], helper: notExecutable });
+            const seen: Error[] = [];
+            pty.onError((e) => seen.push(e));
+            await settled(pty);
+            message = seen.map((e) => e.message).join("\n");
         } catch (e) {
             message = (e as Error).message;
         }
