@@ -61,6 +61,7 @@ Do not "fix" it back.
 | `scripts/build-helper.mjs` | `rustc` per target |
 | `scripts/check-helpers.mjs` | `prepublishOnly` arch gate |
 | `test/live/pty.live.mjs` | real shells + the leak bar |
+| `test/live/lifecycle.live.mjs` | process LIFETIME: controller death, conhosts per pty, job race, graceful kill |
 
 ## The helper (`native/helper.rs`)
 
@@ -99,6 +100,45 @@ the dimensions we set, which an inherited handle cannot fake.
 perform that close **deadlocks** — the spike hung for two minutes. The order is:
 reader thread → wait for the child → `ClosePseudoConsole` → join.
 
+### Process lifetime (0.2.0) — four rules, each with a live check
+
+`test/live/lifecycle.live.mjs`, every check against pids the processes
+REPORTED themselves (`fixtures/sleeper.mjs`), each opening with a control that
+counts them alive first.
+
+1. **The helper dies with its controller.** EOF or a broken frame on stdin
+   means the controller is gone, and the helper hard-kills its tree and exits.
+   The control thread therefore must never `return` for any other reason: a
+   failed pty write drops the rest of the write and keeps reading. On Windows
+   this was MASKED before 0.2.0, not handled: a non-detached Node controller put
+   the helper in libuv's kill-on-close job. That stopped being true the moment
+   the helper was spawned detached, so do not reason from the old Windows
+   behaviour.
+2. **No console of its own (Windows).** `src/pty.ts` spawns the helper
+   `detached`, which is DETACHED_PROCESS. That leaves one conhost per pty, the
+   pseudoconsole's. **The trap that comes with it:** libuv's detached flags
+   include CREATE_NEW_PROCESS_GROUP, which starts the helper with Ctrl-C
+   IGNORED, and children inherit that. So `win::run` calls
+   `SetConsoleCtrlHandler(NULL, FALSE)` before creating the command. Without
+   it the graceful kill types a Ctrl-C nobody honours. CI caught this. Review
+   did not.
+3. **The command is created SUSPENDED**, assigned to the job, then resumed.
+   The race is microseconds wide, so the check holds it open with the helper
+   env var `FANCY_PTY_TEST_ONLY_ASSIGN_DELAY_MS`, read from the HELPER's
+   environment and capped at 10 s. Only a descendant **off** the console can
+   escape: one still attached to the pseudoconsole dies with it anyway. That is
+   why the fixture's grandchild is detached on Windows. The first red run,
+   with an attached grandchild, was green on the old code.
+4. **Every kill runs under `Lifetime`'s lock.** The main thread's `close()`
+   moves to CLOSED before it closes the job handle or returns. No kill can act
+   on a handle, or a pgid, after teardown. A graceful kill is decided on the
+   WHOLE tree being empty (job active-process count; `kill(-pgid, 0)` ==
+   ESRCH), not on the direct child exiting.
+
+`check 8` in `pty.live.mjs` counts `fancy-pty-helper` by IMAGE NAME across the
+machine, so on a desktop running Genie (which ships this package) it reports
+Genie's helpers as survivors. Read it on a clean runner, or by path.
+
 ## Testing
 
 ```
@@ -106,6 +146,7 @@ npm test              # pure protocol, fast + hermetic
 npm run lint          # tsc --noEmit
 npm run build:helper  # rustc + the helper's --selftest
 npm run verify:pty    # LIVE: real shells, resize, kill, orphan sweep, leak bar
+npm run verify:lifecycle  # LIVE: controller death, conhosts, job race, graceful kill
 npm run verify:flash  # LIVE, Windows: no console window ever APPEARS (#4)
 ```
 

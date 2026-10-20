@@ -8,6 +8,86 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-20
+
+Four process-lifetime fixes asked for by Genie 2.0.0-beta.33. Every one is
+proven by `test/live/lifecycle.live.mjs` on real CI runners. That suite was red
+against 0.1.4 first and is green with these fixes.
+
+### Changed
+
+- **BEHAVIOUR CHANGE: a pty now dies with the process that opened it.** If the
+  controlling process exits, crashes or is killed outright, every helper it
+  owned hard-kills its whole tree and exits. On Windows the job object is
+  terminated at once. On POSIX the process group gets SIGHUP, up to 250 ms to
+  leave, then SIGKILL. Before this, on Linux and macOS, every pty and
+  everything it started kept running with nobody left to read or stop it, so a
+  restarted app started duplicates. CI measured 10 helpers, 10 children and 10
+  grandchildren all still alive 2 s after the controller was SIGKILLed on
+  0.1.4. Now it is 0 / 0 / 0 on all four live platforms.
+
+  **What you must DO:** nothing, unless you relied on terminals surviving the
+  process that opened them. There was never a supported detached mode, so
+  that only ever worked by accident, and only on POSIX. If you want terminals
+  to outlive your UI, open them from a long-lived host process, as
+  `fancy-term-host`'s pty host already does. That host stays their controller,
+  so this change does not affect it.
+
+  On Windows the old behaviour was already this one, but only by accident.
+  CI measured 0 survivors on 0.1.4 there, because a Node controller put the
+  helper in libuv's kill-on-close job. Spawning the helper detached (next entry)
+  removes that, and the helper now does it itself.
+
+- **Windows: the helper no longer has a console of its own.** It is spawned
+  detached (`DETACHED_PROCESS`) instead of with a hidden console, which saves
+  one `conhost.exe` (about 8 MB) per pty. Measured in CI: 2 conhosts per helper
+  on 0.1.4, 1 now (the pseudoconsole's own). Nothing to do. The helper's stdio
+  is still the three pipes, and no console window can appear.
+
+### Added
+
+- **`pty.childPid`**: the pid of the command itself (`argv[0]`), sent by the
+  helper right after the command is created and before its first output. So it
+  is set by the first `onData`, and stays `undefined` if the command never
+  started. **`pty.pid` is unchanged**: it is still the helper's pid, and
+  killing it still takes the whole tree.
+
+- **`pty.kill({ graceMs })`**, a graceful stop. On Windows it types Ctrl-C into
+  the console. On POSIX it sends SIGTERM to the process group. If the whole
+  tree, grandchildren included, has not exited within `graceMs`, it is
+  hard-killed. **`pty.killedBy`** (`"graceful"` | `"forced"` | `null`) and a
+  new second argument to `onExit`, `{ killedBy }`, report which happened.
+  `kill()` with no argument is unchanged: an immediate hard kill, now reported
+  as `"forced"`. Existing `onExit(code => …)` listeners keep working. Note
+  that an interactive shell at its prompt ignores both Ctrl-C and SIGTERM, so
+  a bare shell always ends `"forced"`. The graceful path is for the workers
+  running inside it.
+
+  **`"graceful"` means the tree exited by itself after the polite signal. It
+  does not mean the program finished its work.** Whether Ctrl-C or SIGTERM
+  lets a job complete is up to the program. One case worth checking before you
+  rely on it: PHP on Windows has no `pcntl`, and as far as we know Laravel's
+  `queue:work` cannot trap Ctrl-C there, so it would stop mid-job and still be
+  reported `"graceful"`. That is not measured. On POSIX, `queue:work` treats
+  SIGTERM as "finish the current job, then stop".
+
+- Protocol: a `PID` frame (`0x84`), a `KILLED` frame (`0x85`), and an optional
+  `[graceMs u32]` payload on `KILL`. See `native/proto.md`. The empty `KILL` is
+  the 0.1.x frame and keeps its meaning.
+
+### Fixed
+
+- **Windows: a process the command starts in its first instant can no longer
+  escape the tree kill.** The command used to be assigned to the job object
+  only after it had started running. Anything it launched in that window was
+  born outside the job, so neither `kill()` nor the helper's death could reach
+  it. It is now created suspended, assigned, then resumed. The window was too
+  narrow to hit on demand, so the test holds it open with a test-only helper
+  setting (`FANCY_PTY_TEST_ONLY_ASSIGN_DELAY_MS`): red on 0.1.4, green now.
+  Only a descendant that is not attached to the pseudoconsole could escape.
+  One that stays on the console dies when the console closes anyway, which the
+  first red run showed.
+
 ## [0.1.4] - 2026-10-15
 
 ### Fixed

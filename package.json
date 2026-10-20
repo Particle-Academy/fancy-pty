@@ -1,6 +1,6 @@
 {
     "name": "@particle-academy/fancy-pty",
-    "version": "0.1.4",
+    "version": "0.2.0",
     "description": "Zero-dependency pseudo-terminal for Node: a tiny native helper executable plus pure JS. No native addon, no node-gyp, no node-addon-api, no Electron ABI rebuild, no prebuilds to resolve.",
     "repository": {
         "type": "git",
@@ -42,6 +42,7 @@
         "test": "vitest run",
         "test:watch": "vitest",
         "verify:pty": "node --expose-gc test/live/pty.live.mjs",
+        "verify:lifecycle": "node test/live/lifecycle.live.mjs",
         "clean": "rm -rf dist bin/*/",
         "prepublishOnly": "node scripts/check-helpers.mjs && tsup",
         "lint:native": "node scripts/check-native.mjs",

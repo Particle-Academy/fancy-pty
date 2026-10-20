@@ -44,8 +44,12 @@ if (mode === "graceful") {
         stopping = true;
         setTimeout(() => {
             put("done", Date.now());
-            grandchild.kill();
+            // On POSIX the group's SIGTERM has usually ended it already, and
+            // `exit` does not fire twice -- waiting for it then cost a 2 s
+            // fallback and made a 1 s job look like a 3 s one.
+            if (grandchild.exitCode !== null || grandchild.signalCode !== null) process.exit(0);
             grandchild.once("exit", () => process.exit(0));
+            grandchild.kill();
             setTimeout(() => process.exit(0), 2000);
         }, 1000);
     };
