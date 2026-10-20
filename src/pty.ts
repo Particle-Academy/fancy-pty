@@ -7,9 +7,12 @@ import {
     FrameDecoder,
     Request,
     Response,
+    decodeKilled,
+    encodeKill,
     encodeResize,
     encodeSpawn,
     frame,
+    type KillOutcome,
     type SpawnRequest,
 } from "./protocol.js";
 
@@ -25,16 +28,52 @@ import {
  * exactly the behaviour it has today.
  */
 export interface Pty {
-    /** The HELPER's pid, not the shell's. Useful for a teardown sweep. */
+    /**
+     * The HELPER's pid, not the command's — unchanged since 0.1.0. Useful for
+     * a teardown sweep: killing it takes the whole tree with it.
+     */
     readonly pid: number | undefined;
+    /**
+     * The COMMAND's pid — the shell or program in `argv[0]`. Arrives from the
+     * helper right after the command is created and before any output, so it
+     * is set by the first `onData`. `undefined` until then, and forever if the
+     * command never started.
+     */
+    readonly childPid: number | undefined;
     readonly exited: boolean;
     readonly exitCode: number | null;
+    /**
+     * How a `kill()` ended this pty: `"graceful"` if the whole tree was gone
+     * within `graceMs`, `"forced"` if it was hard-killed (always the case for
+     * `kill()` with no grace). `null` if no kill ended it — it exited by
+     * itself, or it is still running. Final once `onExit` has fired.
+     */
+    readonly killedBy: KillOutcome | null;
     write(data: string | Buffer): boolean;
     resize(cols: number, rows: number): boolean;
-    kill(): boolean;
+    /**
+     * `kill()` — a hard kill of the whole tree, now (the 0.1.x behaviour).
+     *
+     * `kill({ graceMs })` — ask first: Ctrl-C into the console on Windows,
+     * `SIGTERM` to the process group on POSIX. If the tree is not EMPTY after
+     * `graceMs` (grandchildren included), it is hard-killed. `killedBy` and
+     * `onExit` report which happened. Note that an interactive shell sitting
+     * at its prompt ignores both, so it will always end `"forced"`.
+     */
+    kill(options?: KillOptions): boolean;
     onData(listener: (chunk: Buffer) => void): void;
-    onExit(listener: (code: number) => void): void;
+    onExit(listener: (code: number, info: ExitInfo) => void): void;
     onError(listener: (error: Error) => void): void;
+}
+
+export interface KillOptions {
+    /** How long to wait for a graceful stop before hard-killing. Absent or 0: hard kill now. */
+    graceMs?: number;
+}
+
+export interface ExitInfo {
+    /** Same as `Pty.killedBy` at the moment of exit. */
+    killedBy: KillOutcome | null;
 }
 
 export interface PtyOptions extends SpawnRequest {
@@ -132,6 +171,29 @@ export function open(options: PtyOptions): Pty {
             // without corrupting the stream the consumer is parsing.
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
+            /**
+             * WINDOWS: `detached` is DETACHED_PROCESS — the helper gets NO
+             * console of its own (F2). Before 0.2.0 it was a console app
+             * started with CREATE_NO_WINDOW, which still creates a console,
+             * just hidden: a second conhost.exe (~8 MB) per pty, beside the
+             * pseudoconsole's own. The helper never needed it — its stdio is
+             * these three pipes, and CreatePseudoConsole needs no caller
+             * console. (The other route, building the helper as a
+             * windows-subsystem exe, was not taken: a GUI-subsystem process
+             * that never opens a window is, as far as I know, given the
+             * "app starting" feedback cursor by default, so every pty open
+             * would risk spinning the user's cursor. Not measured; this route
+             * avoids the question.)
+             *
+             * What it costs: libuv no longer puts the helper in its
+             * kill-on-close job, so the controller dying no longer takes the
+             * helper with it on Windows. The helper now does that itself, on
+             * EOF of its control stream (F1), on every platform.
+             *
+             * POSIX: NOT detached. There `detached` means setsid(), which the
+             * helper does not want — the pty's session belongs to the child.
+             */
+            detached: process.platform === "win32",
         });
     } catch (e) {
         const err = e as NodeJS.ErrnoException;
@@ -144,7 +206,7 @@ export function open(options: PtyOptions): Pty {
 
     const listeners: {
         data: ((c: Buffer) => void)[];
-        exit: ((code: number) => void)[];
+        exit: ((code: number, info: ExitInfo) => void)[];
         error: ((e: Error) => void)[];
     } = { data: [], exit: [], error: [] };
 
@@ -152,6 +214,10 @@ export function open(options: PtyOptions): Pty {
         what: K,
         arg: Parameters<(typeof listeners)[K][number]>[0],
     ): void => {
+        // `exit` carries how it ended as a second argument. Built here, at
+        // emit time, so it is the final answer: the helper sends KILLED
+        // strictly before EXIT, and the process-exit fallback has no KILLED.
+        const extra = what === "exit" ? [{ killedBy } satisfies ExitInfo] : [];
         /**
          * AN UNHEARD `error` GOES TO stderr. (#1)
          *
@@ -183,9 +249,9 @@ export function open(options: PtyOptions): Pty {
             );
         }
 
-        for (const fn of listeners[what] as ((a: unknown) => void)[]) {
+        for (const fn of listeners[what] as ((...a: unknown[]) => void)[]) {
             try {
-                fn(arg);
+                fn(arg, ...extra);
             } catch (e) {
                 // A throwing consumer callback must not take down the pty or
                 // stall the pump, and the remaining listeners still get the
@@ -203,6 +269,8 @@ export function open(options: PtyOptions): Pty {
     const decoder = new FrameDecoder();
     let exited = false;
     let exitCode: number | null = null;
+    let childPid: number | undefined;
+    let killedBy: KillOutcome | null = null;
     let stderrText = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -221,6 +289,10 @@ export function open(options: PtyOptions): Pty {
                 exited = true;
                 exitCode = f.payload.readUInt32LE(0);
                 emit("exit", exitCode);
+            } else if (f.kind === Response.Pid) {
+                if (f.payload.length >= 4) childPid = f.payload.readUInt32LE(0);
+            } else if (f.kind === Response.Killed) {
+                killedBy = decodeKilled(f.payload);
             } else if (f.kind === Response.Error) {
                 emit("error", new Error(f.payload.toString("utf8")));
             } else {
@@ -337,11 +409,17 @@ export function open(options: PtyOptions): Pty {
         get pid() {
             return child.pid;
         },
+        get childPid() {
+            return childPid;
+        },
         get exited() {
             return exited;
         },
         get exitCode() {
             return exitCode;
+        },
+        get killedBy() {
+            return killedBy;
         },
         write(data) {
             return send(
@@ -351,8 +429,8 @@ export function open(options: PtyOptions): Pty {
         resize(cols, rows) {
             return send(frame(Request.Resize, encodeResize(cols, rows)));
         },
-        kill() {
-            return send(frame(Request.Kill, Buffer.alloc(0)));
+        kill(options) {
+            return send(frame(Request.Kill, encodeKill(options?.graceMs)));
         },
         onData(fn) {
             listeners.data.push(fn);
@@ -364,7 +442,8 @@ export function open(options: PtyOptions): Pty {
             // reports immediately.
             if (exited && exitCode !== null) {
                 const code = exitCode;
-                queueMicrotask(() => fn(code));
+                const info: ExitInfo = { killedBy };
+                queueMicrotask(() => fn(code, info));
                 return;
             }
             listeners.exit.push(fn);

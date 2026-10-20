@@ -29,6 +29,12 @@ const T_KILL: u8 = 0x03;
 const T_DATA_OUT: u8 = 0x81;
 const T_EXIT: u8 = 0x82;
 const T_ERROR: u8 = 0x83;
+const T_PID: u8 = 0x84;
+const T_KILLED: u8 = 0x85;
+
+/// `KILLED` payloads.
+const KILLED_GRACEFUL: u8 = 0;
+const KILLED_FORCED: u8 = 1;
 
 /// A frame cap, because a length prefix read off a pipe is attacker-shaped data
 /// even when the peer is our own JS. 64 MiB is far above any real terminal
@@ -97,6 +103,126 @@ impl Out {
             return;
         }
         let _ = w.flush();
+    }
+}
+
+// ------------------------------------------------------------ kill lifecycle
+
+/// Who ended the pty, shared between the control thread (which receives KILL),
+/// the grace watcher, and the main thread (which reports EXIT).
+///
+/// Every kill ACTION runs while the lock is held. That is the whole point of
+/// the type: the main thread's teardown closes the job handle / reaps the
+/// group, and a kill that raced it would act on a handle that no longer names
+/// our tree. `close()` moves to `CLOSED` under the same lock, after which no
+/// kill acts at all.
+struct Lifetime {
+    state: Mutex<u8>,
+    cv: std::sync::Condvar,
+}
+
+const LS_RUNNING: u8 = 0;
+const LS_GRACE: u8 = 1;
+const LS_GRACEFUL: u8 = 2;
+const LS_FORCED: u8 = 3;
+const LS_CLOSED: u8 = 4;
+
+impl Lifetime {
+    fn new() -> Self {
+        Lifetime {
+            state: Mutex::new(LS_RUNNING),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, u8> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A hard kill, now. Also ends a grace period early.
+    fn force(&self, hard: impl FnOnce()) {
+        let mut s = self.lock();
+        if *s == LS_RUNNING || *s == LS_GRACE {
+            hard();
+            *s = LS_FORCED;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Ask nicely. `false` if a kill is already under way or the pty is gone,
+    /// in which case the caller starts no watcher.
+    fn begin_grace(&self, soft: impl FnOnce()) -> bool {
+        let mut s = self.lock();
+        if *s != LS_RUNNING {
+            return false;
+        }
+        soft();
+        *s = LS_GRACE;
+        true
+    }
+
+    /// The grace watcher: poll until the tree is EMPTY (graceful) or the
+    /// deadline passes (hard kill, forced). "Empty" means the whole job or
+    /// process group, not just the direct child -- a worker that exits and
+    /// leaves its own children running has not stopped.
+    fn watch_grace(&self, grace_ms: u32, empty: impl Fn() -> bool, hard: impl FnOnce()) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(grace_ms as u64);
+        loop {
+            {
+                let mut s = self.lock();
+                if *s != LS_GRACE {
+                    return;
+                }
+                if empty() {
+                    *s = LS_GRACEFUL;
+                    self.cv.notify_all();
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    hard();
+                    *s = LS_FORCED;
+                    self.cv.notify_all();
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// The controller is gone (F1). Kill the tree unless the main thread is
+    /// already past teardown. The caller exits the process afterwards.
+    fn controller_gone(&self, hard: impl FnOnce()) {
+        let s = self.lock();
+        if *s != LS_CLOSED {
+            hard();
+        }
+    }
+
+    /// Main thread, once the child has exited: wait out a grace period in
+    /// progress, then stop every later kill from acting. Returns the `KILLED`
+    /// payload to report, if any kill ended this pty.
+    fn close(&self) -> Option<u8> {
+        let mut s = self.lock();
+        while *s == LS_GRACE {
+            s = self.cv.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
+        let outcome = match *s {
+            LS_GRACEFUL => Some(KILLED_GRACEFUL),
+            LS_FORCED => Some(KILLED_FORCED),
+            _ => None,
+        };
+        *s = LS_CLOSED;
+        outcome
+    }
+}
+
+/// `KILL`'s optional payload: `[grace_ms: u32 LE]`. Empty, or zero, is the
+/// 0.1.x meaning -- kill now.
+fn kill_grace_ms(payload: &[u8]) -> u32 {
+    if payload.len() >= 4 {
+        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+    } else {
+        0
     }
 }
 
@@ -390,6 +516,53 @@ fn selftest() {
         }
     }
 
+    // KILL payload: empty means the 0.1.x hard kill, so an old JS side that
+    // sends no payload keeps exactly the behaviour it had.
+    let mut expect = |cond: bool, why: &str| {
+        if cond {
+            println!("  ok   {why}");
+        } else {
+            println!("  FAIL {why}");
+            failures += 1;
+        }
+    };
+    expect(kill_grace_ms(&[]) == 0, "an empty KILL is a hard kill (0.1.x)");
+    expect(
+        kill_grace_ms(&10_000u32.to_le_bytes()) == 10_000,
+        "a 4-byte KILL carries graceMs",
+    );
+
+    // Lifetime: the state machine the three threads share.
+    {
+        let l = Lifetime::new();
+        let mut hit = false;
+        l.force(|| hit = true);
+        expect(hit, "force() runs the hard kill on a running pty");
+        expect(l.close() == Some(KILLED_FORCED), "and close() reports forced");
+        let mut after = false;
+        l.force(|| after = true);
+        expect(!after, "after close() a kill acts on nothing (the handles are gone)");
+    }
+    {
+        let l = Lifetime::new();
+        expect(l.begin_grace(|| {}), "begin_grace() starts on a running pty");
+        expect(!l.begin_grace(|| {}), "a second graceful kill does not start a second watcher");
+        l.watch_grace(1000, || true, || {});
+        expect(l.close() == Some(KILLED_GRACEFUL), "an empty tree inside the grace is graceful");
+    }
+    {
+        let l = Lifetime::new();
+        l.begin_grace(|| {});
+        let mut hard = false;
+        l.watch_grace(30, || false, || hard = true);
+        expect(hard, "a tree still running at the deadline is hard-killed");
+        expect(l.close() == Some(KILLED_FORCED), "and reported forced");
+    }
+    {
+        let l = Lifetime::new();
+        expect(l.close().is_none(), "a pty nobody killed reports no KILLED frame");
+    }
+
     if failures == 0 {
         println!("selftest: all green");
     } else {
@@ -554,6 +727,73 @@ mod win {
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn TerminateJobObject(job: Handle, code: u32) -> i32;
         fn SetInformationJobObject(job: Handle, class: u32, info: *mut c_void, len: u32) -> i32;
+        fn QueryInformationJobObject(
+            job: Handle,
+            class: u32,
+            info: *mut c_void,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+        fn TerminateProcess(h: Handle, code: u32) -> i32;
+        fn ResumeThread(h: Handle) -> u32;
+    }
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const JOB_BASIC_ACCOUNTING_INFO_CLASS: u32 = 1;
+    const WAIT_OBJECT_0: u32 = 0;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobBasicAccountingInformation {
+        total_user_time: i64,
+        total_kernel_time: i64,
+        this_period_total_user_time: i64,
+        this_period_total_kernel_time: i64,
+        total_page_fault_count: u32,
+        total_processes: u32,
+        active_processes: u32,
+        total_terminated_processes: u32,
+    }
+
+    /// The tree, as one thing to kill or to ask "is anyone left".
+    ///
+    /// `in_job` is false only if the job could not be created or the child
+    /// could not be assigned; then the direct child is all we can reach, and
+    /// saying so in the code beats a TerminateJobObject on an empty job that
+    /// reports success and kills nothing.
+    #[derive(Clone, Copy)]
+    struct Tree {
+        job: SendHandle,
+        child: SendHandle,
+        in_job: bool,
+    }
+
+    impl Tree {
+        unsafe fn hard_kill(&self) {
+            if self.in_job {
+                TerminateJobObject(self.job.0, 1);
+            } else {
+                TerminateProcess(self.child.0, 1);
+            }
+        }
+
+        unsafe fn empty(&self) -> bool {
+            if !self.in_job {
+                return WaitForSingleObject(self.child.0, 0) == WAIT_OBJECT_0;
+            }
+            let mut info = JobBasicAccountingInformation::default();
+            let ok = QueryInformationJobObject(
+                self.job.0,
+                JOB_BASIC_ACCOUNTING_INFO_CLASS,
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<JobBasicAccountingInformation>() as u32,
+                std::ptr::null_mut(),
+            );
+            // A failed query is "not known to be empty", never "empty": the
+            // safe misreading ends in a hard kill at the deadline, the unsafe
+            // one would report a graceful stop with the tree still running.
+            ok != 0 && info.active_processes == 0
+        }
     }
 
     /// TEST-ONLY: widen the gap between creating the child and assigning it to
@@ -746,7 +986,12 @@ mod win {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                // CREATE_SUSPENDED (F3): the child must be IN the job before
+                // it executes a single instruction. Assigning after it runs
+                // leaves a window in which anything it spawns is born outside
+                // the job, and then neither KILL nor KILL_ON_JOB_CLOSE can
+                // reach it -- the tree kill silently becomes a shell kill.
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                 env_block.as_mut_ptr() as *mut c_void,
                 cwd.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
                 &mut si,
@@ -762,8 +1007,17 @@ mod win {
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
-            if !job.is_null() {
-                AssignProcessToJobObject(job, pi.h_process);
+            let in_job = !job.is_null() && AssignProcessToJobObject(job, pi.h_process) != 0;
+
+            // The command's own pid (F2b), before any output can arrive, so a
+            // consumer holding `childPid` has it by the first `onData`.
+            out.frame(T_PID, &pi.dw_process_id.to_le_bytes());
+
+            if ResumeThread(pi.h_thread) == u32::MAX {
+                let e = last("ResumeThread");
+                TerminateProcess(pi.h_process, 1);
+                ClosePseudoConsole(hpcon);
+                return Err(e);
             }
 
             // The pseudoconsole owns its ends now. Holding our copies open
@@ -776,6 +1030,12 @@ mod win {
             let writer_h = SendHandle(our_write);
             let pcon = SendHandle(hpcon);
             let job_h = SendHandle(job);
+            let tree = Tree {
+                job: job_h,
+                child,
+                in_job,
+            };
+            let life = Arc::new(Lifetime::new());
 
             // Reader: pty -> framed stdout. It MUST be its own thread. EOF here
             // arrives only when ClosePseudoConsole runs, so draining on the
@@ -803,11 +1063,39 @@ mod win {
             // Control: framed stdin -> pty writes, resizes, kill. Detached on
             // purpose -- it blocks in a read that only the JS side can end, so
             // joining it would make every clean exit wait for the consumer.
+            //
+            // It must keep reading for the helper's WHOLE life, because its
+            // EOF is the only way the helper learns the controller died (F1).
+            // So nothing in here returns except that.
             let out_c = out.clone();
+            let life_c = life.clone();
             let mut control = control;
             std::thread::spawn(move || loop {
                 match read_frame(&mut control) {
-                    Ok(None) => return, // the JS side closed the channel
+                    // THE CONTROLLER IS GONE (F1) -- crashed, killed, or closed
+                    // the channel. Nobody can read this pty or ever kill it, so
+                    // take the tree down and go. Before 0.2.0 this thread just
+                    // returned and the main thread went on waiting for a shell
+                    // that nobody would ever end. On Windows that was masked,
+                    // not fixed: a Node controller spawned the helper
+                    // non-detached, so libuv's kill-on-close job took the
+                    // helper down with it (CI measured 0 survivors on 0.1.4 on
+                    // Windows and 10/10/10 on every POSIX runner). 0.2.0 spawns
+                    // detached (F2), so this is now the only guard there too.
+                    //
+                    // A broken stream counts too: after a truncated or
+                    // oversized frame there is no way back into sync, so the
+                    // channel is as good as closed. Said first, in case anyone
+                    // is still reading.
+                    Ok(None) => {
+                        life_c.controller_gone(|| tree.hard_kill());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        out_c.frame(T_ERROR, format!("control stream: {e}").as_bytes());
+                        life_c.controller_gone(|| tree.hard_kill());
+                        std::process::exit(1);
+                    }
                     Ok(Some(f)) => match f.kind {
                         T_DATA_IN => {
                             let mut at = 0usize;
@@ -822,8 +1110,10 @@ mod win {
                                 );
                                 if ok == 0 || w == 0 {
                                     // The pty is gone and the child is exiting.
-                                    // Expected, not an error worth a frame.
-                                    return;
+                                    // Expected, not an error worth a frame --
+                                    // drop the rest of this write, keep
+                                    // listening for the controller.
+                                    break;
                                 }
                                 at += w as usize;
                             }
@@ -844,26 +1134,40 @@ mod win {
                             );
                         }
                         T_KILL => {
-                            if !job_h.0.is_null() {
-                                TerminateJobObject(job_h.0, 1);
+                            let grace = kill_grace_ms(&f.payload);
+                            if grace == 0 {
+                                life_c.force(|| tree.hard_kill());
+                            } else if life_c.begin_grace(|| {
+                                // Ctrl-C, typed into the pseudoconsole (F4).
+                                // conhost turns it into CTRL_C_EVENT for every
+                                // process on the console -- the same thing a
+                                // person pressing Ctrl-C in the terminal does.
+                                let etx = [0x03u8];
+                                let mut w: u32 = 0;
+                                WriteFile(writer_h.0, etx.as_ptr(), 1, &mut w, std::ptr::null_mut());
+                            }) {
+                                let life_w = life_c.clone();
+                                std::thread::spawn(move || {
+                                    life_w.watch_grace(grace, || tree.empty(), || tree.hard_kill());
+                                });
                             }
-                            return;
                         }
                         other => out_c.frame(
                             T_ERROR,
                             format!("unknown frame type 0x{other:02x}").as_bytes(),
                         ),
                     },
-                    Err(e) => {
-                        out_c.frame(T_ERROR, format!("control stream: {e}").as_bytes());
-                        return;
-                    }
                 }
             });
 
             WaitForSingleObject(child.0, u32::MAX);
             let mut code: u32 = 0;
             GetExitCodeProcess(child.0, &mut code);
+
+            // A graceful kill is not over when the direct child exits: the
+            // watcher decides once the whole JOB is empty (or forces it), and
+            // the job handle must stay open until it has.
+            let killed = life.close();
 
             // Order matters, and this is the fix the spike paid for: the child
             // is gone, so closing the pseudoconsole is what gives the reader
@@ -876,6 +1180,9 @@ mod win {
             CloseHandle(pi.h_thread);
             if !job_h.0.is_null() {
                 CloseHandle(job_h.0);
+            }
+            if let Some(how) = killed {
+                out.frame(T_KILLED, &[how]);
             }
             Ok(code)
         }

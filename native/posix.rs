@@ -79,6 +79,9 @@ const EIO: i32 = 5;
 const EINTR: i32 = 4;
 const SIGKILL: i32 = 9;
 const SIGHUP: i32 = 1;
+// SIGTERM and ESRCH are the same number on Linux and macOS.
+const SIGTERM: i32 = 15;
+const ESRCH: i32 = 3;
 
 extern "C" {
     fn posix_openpt(flags: i32) -> i32;
@@ -97,9 +100,33 @@ extern "C" {
     fn _exit(code: i32) -> !;
     fn waitpid(pid: Pid, status: *mut i32, options: i32) -> Pid;
     fn killpg(pgrp: Pid, sig: i32) -> i32;
+    fn kill(pid: Pid, sig: i32) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn strlen(s: *const c_char) -> usize;
+}
+
+/// The pty's process group: the child is its leader (`setsid`), so its pid
+/// IS the pgid, and every descendant that did not leave the group is in it.
+#[derive(Clone, Copy)]
+struct Group(Pid);
+
+impl Group {
+    /// SIGHUP then SIGKILL: what a closing terminal sends, then the guarantee.
+    fn hard_kill(&self) {
+        unsafe {
+            killpg(self.0, SIGHUP);
+            killpg(self.0, SIGKILL);
+        }
+    }
+
+    /// Nobody left in the group. `kill(-pgid, 0)` fails with ESRCH exactly
+    /// then; any other answer (including success on a not-yet-reaped zombie
+    /// leader) is "not known to be empty", which errs toward a forced kill at
+    /// the deadline rather than a false "graceful".
+    fn empty(&self) -> bool {
+        unsafe { kill(-self.0, 0) != 0 && errno() == ESRCH }
+    }
 }
 
 fn errno() -> i32 {
@@ -352,7 +379,12 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
         // rather than just the shell, which is the POSIX equivalent of the job
         // object on Windows.
         let pgid = child;
+        let group = Group(pgid);
+        let life = Arc::new(Lifetime::new());
         let master_fd = master.into_raw();
+
+        // The command's own pid (F2b), before any output can arrive.
+        out.frame(T_PID, &(child as u32).to_le_bytes());
 
         // Set immediately before we close the master, so the reader can tell
         // "the fd went away because WE closed it" from a genuine fault. Without
@@ -401,11 +433,31 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             let _ = drained_tx.send(());
         });
 
+        // Control thread. It must keep reading for the helper's whole life:
+        // EOF on this stream is the only way the helper learns its controller
+        // died (F1), so nothing in here returns.
         let control_out = out.clone();
+        let control_life = life.clone();
         let mut control = control;
         std::thread::spawn(move || loop {
             match read_frame(&mut control) {
-                Ok(None) => return,
+                // THE CONTROLLER IS GONE (F1). Before 0.2.0 this thread
+                // returned and the main thread kept waiting on a shell nobody
+                // could ever end -- so a crashed consumer left every pty and
+                // its whole tree running, and its successor started duplicates.
+                // SIGHUP first (a closing terminal), a short grace, then
+                // SIGKILL, then exit.
+                Ok(None) => {
+                    control_life.controller_gone(|| controller_gone_kill(group));
+                    std::process::exit(1);
+                }
+                // A broken stream is as closed as a closed one: there is no
+                // way back into frame sync after it.
+                Err(e) => {
+                    control_out.frame(T_ERROR, format!("control stream: {e}").as_bytes());
+                    control_life.controller_gone(|| controller_gone_kill(group));
+                    std::process::exit(1);
+                }
                 Ok(Some(f)) => match f.kind {
                     T_DATA_IN => {
                         let mut at = 0usize;
@@ -416,10 +468,10 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
                                 if errno() == EINTR {
                                     continue;
                                 }
-                                return; // the pty is gone; the child is exiting
+                                break; // the pty is gone; the child is exiting
                             }
                             if w == 0 {
-                                return;
+                                break;
                             }
                             at += w as usize;
                         }
@@ -446,24 +498,30 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
                         killpg(pgid, 28); // SIGWINCH
                     }
                     T_KILL => {
-                        // SIGHUP first: it is what a closing terminal
-                        // sends, so a shell gets the chance to run its own
-                        // teardown. SIGKILL immediately after, because "asked
-                        // nicely" is not a guarantee and this helper must not
-                        // outlive its pty.
-                        killpg(pgid, SIGHUP);
-                        killpg(pgid, SIGKILL);
-                        return;
+                        let grace = kill_grace_ms(&f.payload);
+                        if grace == 0 {
+                            // 0.1.x behaviour: SIGHUP then SIGKILL, no gap.
+                            control_life.force(|| group.hard_kill());
+                        } else if control_life.begin_grace(|| {
+                            // F4. SIGTERM to the whole group: what a process
+                            // supervisor sends, and what `queue:work` and most
+                            // workers treat as "finish the current job, then
+                            // stop". (An INTERACTIVE shell ignores SIGTERM, so
+                            // a bare shell will run to the deadline and be
+                            // reported "forced" -- which is the truth.)
+                            killpg(pgid, SIGTERM);
+                        }) {
+                            let watch_life = control_life.clone();
+                            std::thread::spawn(move || {
+                                watch_life.watch_grace(grace, || group.empty(), || group.hard_kill());
+                            });
+                        }
                     }
                     other => control_out.frame(
                         T_ERROR,
                         format!("unknown frame type 0x{other:02x}").as_bytes(),
                     ),
                 },
-                Err(e) => {
-                    control_out.frame(T_ERROR, format!("control stream: {e}").as_bytes());
-                    return;
-                }
             }
         });
 
@@ -475,6 +533,10 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             }
             break;
         }
+
+        // The leader is reaped. A graceful kill is still not over until the
+        // whole GROUP is empty, which the watcher decides (or forces).
+        let killed = life.close();
 
         // DRAIN FIRST, THEN CLOSE -- the opposite order loses output, and CI
         // caught it rather than review.
@@ -510,7 +572,26 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
         } else {
             128 + (status & 0x7f)
         };
+        if let Some(how) = killed {
+            out.frame(T_KILLED, &[how]);
+        }
         Ok(code as u32)
+    }
+}
+
+/// F1's teardown: SIGHUP (a closing terminal -- the shell's cue to run its own
+/// teardown), up to 250 ms for the group to empty, then SIGKILL regardless.
+/// Short, because nobody is waiting on the far side: the controller is dead.
+fn controller_gone_kill(group: Group) {
+    unsafe {
+        killpg(group.0, SIGHUP);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while !group.empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    unsafe {
+        killpg(group.0, SIGKILL);
     }
 }
 

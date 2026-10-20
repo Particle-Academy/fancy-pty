@@ -1,5 +1,5 @@
 export { open } from "./pty.js";
-export type { Pty, PtyOptions } from "./pty.js";
+export type { ExitInfo, KillOptions, Pty, PtyOptions } from "./pty.js";
 
 export {
     SUPPORTED,
@@ -16,8 +16,10 @@ export {
     HEADER_BYTES,
     MAX_FRAME_BYTES,
     clampDimension,
+    decodeKilled,
+    encodeKill,
     encodeResize,
     encodeSpawn,
     frame,
 } from "./protocol.js";
-export type { DecodedFrame, SpawnRequest } from "./protocol.js";
+export type { DecodedFrame, KillOutcome, SpawnRequest } from "./protocol.js";

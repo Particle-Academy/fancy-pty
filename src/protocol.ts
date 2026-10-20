@@ -30,6 +30,34 @@ export const enum Response {
     Data = 0x81,
     Exit = 0x82,
     Error = 0x83,
+    /** `[pid: u32 LE]` — the COMMAND's pid, sent once, before any `Data`. */
+    Pid = 0x84,
+    /** `[how: u8]` — 0 graceful, 1 forced. Sent just before `Exit`, only if a kill ended the pty. */
+    Killed = 0x85,
+}
+
+/** How a `kill()` ended a pty. */
+export type KillOutcome = "graceful" | "forced";
+
+/** The `Killed` frame's payload byte, decoded. Unknown values are `null`, never guessed. */
+export function decodeKilled(payload: Buffer): KillOutcome | null {
+    if (payload.length < 1) return null;
+    if (payload[0] === 0) return "graceful";
+    if (payload[0] === 1) return "forced";
+    return null;
+}
+
+/**
+ * `KILL`'s payload. No grace (absent, zero, negative, not a number) is the
+ * EMPTY payload — byte-for-byte the 0.1.x frame, so it means exactly what it
+ * meant: a hard kill, now. A grace is `[graceMs: u32 LE]`, clamped to u32
+ * (so `Infinity` is ~49 days, not a hard kill).
+ */
+export function encodeKill(graceMs?: number): Buffer {
+    if (graceMs === undefined || Number.isNaN(graceMs) || graceMs <= 0) return Buffer.alloc(0);
+    const b = Buffer.allocUnsafe(4);
+    b.writeUInt32LE(Math.min(0xffff_ffff, Math.ceil(graceMs)), 0);
+    return b;
 }
 
 export const HEADER_BYTES = 5;
