@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `ci/**` so a failing-first test can be proven RED on real runners before
+    # its fix lands, without opening a PR for our own work.
+    branches: [main, "ci/**"]
   pull_request:
 
 permissions:
@@ -160,3 +162,10 @@ jobs:
       - name: Live suite
         if: matrix.live
         run: node --expose-gc test/live/pty.live.mjs
+
+      # Process LIFETIME, separately: the controller dying, conhosts per pty,
+      # the job assignment race, graceful kill. Not gated on the live suite
+      # passing (`!cancelled()`), so one red does not hide the other.
+      - name: Lifecycle suite (F1-F4)
+        if: matrix.live && !cancelled()
+        run: node test/live/lifecycle.live.mjs

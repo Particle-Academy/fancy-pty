@@ -556,6 +556,19 @@ mod win {
         fn SetInformationJobObject(job: Handle, class: u32, info: *mut c_void, len: u32) -> i32;
     }
 
+    /// TEST-ONLY: widen the gap between creating the child and assigning it to
+    /// the job, so `test/live/lifecycle.live.mjs` (F3) hits the race on every
+    /// run instead of once in a blue moon. Read from the HELPER's environment,
+    /// never the child's (that one comes from SPAWN). Capped at 10 s. Unset in
+    /// every real deployment, where it costs one env lookup.
+    fn test_only_assign_delay() -> u64 {
+        std::env::var("FANCY_PTY_TEST_ONLY_ASSIGN_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.min(10_000))
+            .unwrap_or(0)
+    }
+
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -744,6 +757,10 @@ mod win {
                 let e = spawn_error(&req.argv[0]);
                 ClosePseudoConsole(hpcon);
                 return Err(e);
+            }
+            let delay = test_only_assign_delay();
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
             }
             if !job.is_null() {
                 AssignProcessToJobObject(job, pi.h_process);
