@@ -20,8 +20,19 @@ import path from "node:path";
 const [dir, tag, mode = "idle"] = process.argv.slice(2);
 const put = (name, value) => writeFileSync(path.join(dir, `${tag}.${name}`), String(value));
 
+// WINDOWS: the grandchild is DETACHED (no console), on purpose. A grandchild
+// still attached to the pseudoconsole dies when the pseudoconsole closes,
+// job or no job -- the first red run of F3 measured exactly that, green on the
+// old code with the race window held open for 3 s. What the job object is for
+// is the descendant that is NOT on the console (a service, a GUI app, anything
+// spawned windowless), so that is what this must be to measure it.
+//
+// POSIX: NOT detached, because there `detached` is setsid(), which leaves the
+// process group -- and nothing in this package claims to reach a process
+// that deliberately left its group.
 const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     stdio: "ignore",
+    detached: process.platform === "win32",
 });
 put("grandchild", grandchild.pid);
 put("child", process.pid);
