@@ -736,6 +736,7 @@ mod win {
         ) -> i32;
         fn TerminateProcess(h: Handle, code: u32) -> i32;
         fn ResumeThread(h: Handle) -> u32;
+        fn SetConsoleCtrlHandler(handler: *const c_void, add: i32) -> i32;
     }
 
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
@@ -871,6 +872,17 @@ mod win {
 
     pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<u32, String> {
         unsafe {
+            // RE-ENABLE Ctrl-C before creating the command, or F4's graceful
+            // kill cannot work. The JS side spawns this helper detached, and
+            // libuv's detached flags include CREATE_NEW_PROCESS_GROUP, which
+            // starts the process with Ctrl-C IGNORED. That setting is
+            // INHERITED, so every command under the pty ignored the Ctrl-C
+            // that `kill({ graceMs })` types: the first green-everything-else
+            // CI run showed a worker with a SIGINT handler sitting out the
+            // full 10 s grace and being forced. NULL + FALSE is the documented
+            // way to clear the flag, and our children inherit the cleared one.
+            SetConsoleCtrlHandler(std::ptr::null(), 0);
+
             let mut pty_in_read = INVALID_HANDLE_VALUE;
             let mut our_write = INVALID_HANDLE_VALUE;
             let mut our_read = INVALID_HANDLE_VALUE;
