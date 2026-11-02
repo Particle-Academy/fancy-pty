@@ -8,6 +8,29 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux and macOS: the shell no longer inherits the helper's other file
+  descriptors** (genie#1452). Before exec, the forked child closed only the fds
+  it knew about. So any fd the helper had received without close-on-exec rode
+  into the shell and everything it ran, for as long as the terminal lived. On
+  Genie's Linux VM that was a Chromium DevTools listening socket on :9222,
+  which kept accepting connections that nothing answered. The child now closes
+  every fd from 3 up, except the pipe that reports a failed exec. On Linux it
+  uses `close_range`. On macOS, and on kernels older than 5.9, it loops
+  `close()` up to the fd limit, capped at 65536. Failed-exec reporting is
+  unchanged and still tested.
+
+  A pure Node consumer was never exposed: Node 22 marks inherited fds
+  close-on-exec at startup. The exposure comes from native code in the
+  consumer opening an fd without that flag later, as Chromium does in an
+  Electron app. Windows was never affected, because the command is created
+  with handle inheritance off.
+
+  **What you must DO:** nothing. If you relied on a pty's shell inheriting an
+  extra fd from your process, which was never supported, pass what it needs
+  explicitly (an env var, a path, a socket address).
+
 ## [0.2.0] - 2026-10-20
 
 Four process-lifetime fixes asked for by Genie 2.0.0-beta.33. Every one is

@@ -208,7 +208,7 @@ agent popping a window) is absent by architecture in either case, but the
 detached host is not what is being measured here. Say "no flash on the
 interactive desktop, instrument validated" rather than rounding it up.
 
-### Three POSIX traps (`native/posix.rs`)
+### Four POSIX traps (`native/posix.rs`)
 
 **1. Nothing may allocate between `fork()` and `execvp()`.** Only
 async-signal-safe calls are legal there — allocating, formatting a string or
@@ -228,6 +228,17 @@ close.
 reports; only `SIGWINCH` makes a running program re-read it. Doing just the
 ioctl is the version of this bug that looks like it works, because the obvious
 test (`stty size`) passes.
+
+**4. The shell gets fds 0-2 and nothing else.** The child closes every fd from
+3 up before `execvp`: `close_range` on Linux, otherwise a `close()` loop capped
+at 65536, with the loop bound read BEFORE the fork. The one fd kept is
+`err_write`, the exec-failure pipe. It is CLOEXEC, so a successful exec closes
+it and the parent reads EOF. Close it early and a failed exec looks like a
+success. genie#1452 was a DevTools socket leaking into every shell. Check `6c`
+in `pty.live.mjs` covers it, and it drives the helper from a SHELL rather than
+through `open()`. That is because Node 22 marks inherited fds CLOEXEC at
+startup, so a plain Node consumer cannot reproduce the leak, and the first
+draft's positive control caught exactly that.
 
 `setsid()` is what allows `TIOCSCTTY`, and it also makes the child a
 process-group leader — which is why `killpg(pgid, …)` takes the whole tree, the

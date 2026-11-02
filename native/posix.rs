@@ -104,6 +104,95 @@ extern "C" {
     fn pipe(fds: *mut i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn strlen(s: *const c_char) -> usize;
+    fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+}
+
+// ---------------------------------------------------------------- fd hygiene
+//
+// The shell must inherit exactly 0, 1 and 2. Everything else the helper holds
+// without close-on-exec -- including whatever ITS parent passed down -- would
+// otherwise ride through `execvp` into the shell and every program it runs.
+// Genie#1452 measured the real cost on a Linux VM: a Chromium DevTools
+// listening socket on :9222 stayed open (accepting, never answered) for as long
+// as the terminal's shell lived.
+//
+// Constants, with provenance as above:
+//   RLIMIT_NOFILE    Linux 7 (asm-generic/resource.h), macOS 8 (sys/resource.h)
+//   F_DUPFD_CLOEXEC  Linux 1030 (F_LINUX_SPECIFIC_BASE 1024 + 6), macOS 67
+//   SYS_close_range  436 on BOTH x86_64 and aarch64 Linux: it was added in 5.9,
+//                    after the syscall tables were unified, so it has one
+//                    number on every architecture.
+#[cfg(target_os = "linux")]
+const RLIMIT_NOFILE: i32 = 7;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const RLIMIT_NOFILE: i32 = 8;
+#[cfg(target_os = "linux")]
+const F_DUPFD_CLOEXEC: i32 = 1030;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const F_DUPFD_CLOEXEC: i32 = 67;
+#[cfg(target_os = "linux")]
+const SYS_CLOSE_RANGE: i64 = 436;
+
+/// The highest fd the fallback loop will close, exclusive.
+///
+/// THE TRADE, stated: Node raises its own RLIMIT_NOFILE soft limit to the hard
+/// limit at startup, and the helper inherits that -- commonly 524288 or 1048576
+/// on Linux. A `close()` loop that far would add a visible delay to every
+/// spawn, so the loop stops at 65536. An inherited fd ABOVE the cap would still
+/// leak through the fallback. That is theoretical rather than observed, and on
+/// Linux 5.9+ it does not arise at all: `close_range` covers the whole range in
+/// one call and the loop is only the fallback for older kernels. On macOS (no
+/// `close_range`) the default limits sit far below the cap.
+const CLOSE_LOOP_CAP: i32 = 65536;
+
+#[repr(C)]
+struct RLimit {
+    cur: u64,
+    max: u64,
+}
+
+/// Computed BEFORE the fork: `getrlimit` is not on the async-signal-safe list.
+fn close_loop_limit() -> i32 {
+    let mut r = RLimit { cur: 0, max: 0 };
+    let soft = if unsafe { getrlimit(RLIMIT_NOFILE, &mut r) } == 0 {
+        r.cur
+    } else {
+        CLOSE_LOOP_CAP as u64
+    };
+    // RLIM_INFINITY is a huge value on both platforms, so it lands on the cap.
+    soft.clamp(3, CLOSE_LOOP_CAP as u64) as i32
+}
+
+/// CHILD ONLY, after the dup2s onto 0-2: close every fd >= 3 except `keep`
+/// (the exec-failure pipe, which must survive until `execvp` and is CLOEXEC, so
+/// a successful exec closes it by itself). `keep` is guaranteed >= 3 by the
+/// parent. Async-signal-safe: `syscall` is a bare trap stub and `close` is on
+/// the list. EBADF from the loop is the expected answer for most fds and is
+/// ignored.
+unsafe fn close_inherited_fds(keep: i32, loop_limit: i32) {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn syscall(num: i64, ...) -> i64;
+        }
+        // Two calls, skipping `keep`. ENOSYS (kernel < 5.9) or anything else
+        // falls through to the loop below, which is correct if slower.
+        let below = if keep > 3 {
+            syscall(SYS_CLOSE_RANGE, 3u64, (keep - 1) as u64, 0u64)
+        } else {
+            0
+        };
+        if below == 0 && syscall(SYS_CLOSE_RANGE, (keep + 1) as u64, u32::MAX as u64, 0u64) == 0 {
+            return;
+        }
+    }
+    let mut fd = 3;
+    while fd < loop_limit {
+        if fd != keep {
+            close(fd);
+        }
+        fd += 1;
+    }
 }
 
 /// The pty's process group: the child is its leader (`setsid`), so its pid
@@ -267,10 +356,23 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             return Err(oserr("pipe"));
         }
         let err_read = Fd(err_fds[0]);
-        let err_write = Fd(err_fds[1]);
+        let mut err_write = Fd(err_fds[1]);
         if fcntl(err_write.get(), F_SETFD, FD_CLOEXEC) != 0 {
             return Err(oserr("fcntl(FD_CLOEXEC)"));
         }
+        // The child closes every fd >= 3 except this one, and dup2s the slave
+        // over 0-2. Both would destroy it if it sat at 0-2, which happens only
+        // if the helper was started with a std fd closed. Move it up, here,
+        // where moving it is allowed; the copy is CLOEXEC like the original.
+        if err_write.get() < 3 {
+            let moved = fcntl(err_write.get(), F_DUPFD_CLOEXEC, 3);
+            if moved < 0 {
+                return Err(oserr("fcntl(F_DUPFD_CLOEXEC)"));
+            }
+            err_write = Fd(moved); // drops (closes) the low copy
+        }
+        // getrlimit is not async-signal-safe, so the loop bound is read now.
+        let close_limit = close_loop_limit();
 
         let child = fork();
         if child < 0 {
@@ -327,6 +429,11 @@ pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<
             // never closes.
             close(master.get());
             close(err_read.get());
+            // Everything else the helper inherited stops here (genie#1452):
+            // the shell gets 0-2 and nothing more. `err_write` is kept -- it is
+            // how `fail()` below reports, and being CLOEXEC it still vanishes
+            // on a successful exec, which is the parent's EOF signal.
+            close_inherited_fds(err_write.get(), close_limit);
 
             if let Some(cwd) = &c_cwd {
                 extern "C" {

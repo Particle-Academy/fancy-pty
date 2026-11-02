@@ -148,6 +148,100 @@ console.log("\n6. a failed spawn is an ERROR, never a silent empty terminal");
     ok(c.errors.length > 0, "and it reported an error");
 }
 
+// ----------------------------------- 6c. the shell inherits 0-2 and NOTHING else
+if (!isWindows) {
+    console.log("\n6c. an fd the CONSUMER inherited does not reach the pty's shell (genie#1452)");
+    // genie#1452: the helper's forked child closed only the fds it knew about,
+    // so every non-CLOEXEC fd its parent passed down rode through execvp into
+    // the shell -- on Genie's VM, a DevTools listening socket on :9222 that
+    // kept accepting connections for as long as the terminal lived.
+    //
+    // WHY THIS DRIVES THE HELPER DIRECTLY instead of going through `open()`:
+    // Node cannot produce the condition. Measured on Node 22 (Linux):
+    // started with fd 9 open and NOT close-on-exec, Node marks it O_CLOEXEC
+    // at startup (/proc/self/fdinfo/9 flags 02100000), and libuv opens all of
+    // its own fds CLOEXEC, so a helper spawned by a plain Node process never
+    // receives one. The first draft of this check went through `open()` and
+    // its positive control caught exactly that. A real consumer gets there
+    // through native code opening an fd after that startup sweep (Genie's
+    // was Chromium's), which a test cannot reproduce portably. So the helper
+    // is started by a SHELL holding fd 9 (`9</dev/null` is not CLOEXEC),
+    // speaking the frame protocol over a pipe -- exactly what Node does,
+    // minus the sweep.
+    const { spawnSync } = await import("node:child_process");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const pathMod = await import("node:path");
+    const { encodeSpawn, frame, FrameDecoder } = await import("../../dist/index.js");
+
+    const LEAKED = 9;
+    // `exec 8<` opens fd 8 INSIDE the shell: a positive control proving the
+    // probe reports a non-std fd the shell really has.
+    const PROBE =
+        `exec 8</dev/null; printf 'FDS:'; ` +
+        `for n in 0 1 2 8 ${LEAKED}; do [ -e /dev/fd/$n ] && printf '%s,' $n; done; echo ':END'`;
+    const parse = (text) => {
+        const m = text.match(/FDS:([0-9,]*):END/);
+        return m ? m[1].split(",").filter(Boolean).map(Number) : null;
+    };
+
+    const dir = mkdtempSync(pathMod.join(tmpdir(), "fancy-pty-fd-"));
+    /**
+     * Run the helper with fd 9 held, feeding it one SPAWN frame. The `sleep`
+     * keeps its stdin open: EOF there means "the controller died", and the
+     * helper would kill the shell before it printed (F1).
+     */
+    const runHelper = (argv) => {
+        const file = pathMod.join(dir, `spawn-${Math.random().toString(36).slice(2)}.bin`);
+        writeFileSync(file, frame(0x00, encodeSpawn({ argv, env: process.env, cols: 80, rows: 24 })));
+        const r = spawnSync(
+            "/bin/sh",
+            ["-c", `{ cat "$1"; sleep 2; } | "$0" ${LEAKED}</dev/null`, helperPath(), file],
+            { timeout: 30000, maxBuffer: 16 * 1024 * 1024 },
+        );
+        const dec = new FrameDecoder();
+        let data = "";
+        let exit;
+        const errors = [];
+        for (const f of r.stdout ? dec.push(r.stdout) : []) {
+            if (f.kind === 0x81) data += f.payload.toString("utf8");
+            else if (f.kind === 0x82) exit = f.payload.readUInt32LE(0);
+            else if (f.kind === 0x83) errors.push(f.payload.toString("utf8"));
+        }
+        return { data, exit, errors, status: r.status };
+    };
+
+    // Positive control: the SAME redirection on a plain exec. If fd 9 did not
+    // reach this shell, "absent under the pty" would prove nothing.
+    const plain = spawnSync("/bin/sh", ["-c", `"$0" -c "$1" ${LEAKED}</dev/null`, "/bin/sh", PROBE], {
+        encoding: "utf8",
+    });
+    const control = parse(plain.stdout ?? "");
+    ok(
+        Array.isArray(control) && control.includes(LEAKED) && control.includes(8),
+        `control: a plain exec under the same redirection DOES carry fd ${LEAKED}, and the probe sees it (${JSON.stringify(control)})`,
+    );
+
+    const sub = runHelper(["/bin/sh", "-c", PROBE]);
+    const fds = parse(sub.data);
+    ok(Array.isArray(fds), `the pty's shell ran the probe (${JSON.stringify(sub.data.slice(0, 200))})`);
+    ok([0, 1, 2].every((n) => fds?.includes(n)), `the pty's shell has 0, 1 and 2 (${JSON.stringify(fds)})`);
+    ok(fds?.includes(8) === true, "control: the probe sees an fd the shell opened itself (8)");
+    ok(fds !== null && !fds.includes(LEAKED), `the pty's shell does NOT have the helper's inherited fd ${LEAKED} (${JSON.stringify(fds)})`);
+    ok(sub.exit === 0 && sub.errors.length === 0, `and exited 0 with no error frames (exit ${sub.exit}; ${sub.errors.join("; ")})`);
+
+    // The fix closes every fd >= 3 EXCEPT the exec-failure pipe. Close that one
+    // too and a failed exec reads as EOF, i.e. "exec succeeded", so the
+    // consumer gets a silent empty terminal instead of this error. Run under
+    // the same fd layout so it exercises the rewritten child path.
+    const bad = runHelper(["this-program-does-not-exist-xyz"]);
+    ok(bad.exit !== undefined, `a failed exec still reports EXIT (${bad.exit})`);
+    ok(
+        bad.errors.some((m) => /failed to start/.test(m)),
+        `and still reports WHY it failed (${JSON.stringify(bad.errors).slice(0, 160)})`,
+    );
+}
+
 // ------------------------------------------ 6b. Windows command resolution
 if (isWindows) {
     console.log("\n6b. how a bare command name resolves on Windows");
