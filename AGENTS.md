@@ -309,10 +309,10 @@ is written in, and it did not measure threads at all. See
 run — nothing in CI hosts them natively. Say "builds, unproven" for those two
 rather than rounding four green platforms up to six.
 
-**Published.** `@particle-academy/fancy-pty` is on npm — `0.1.3` is `latest` as
-of 2026-10-11, and CI publishes by tag over OIDC, so the owner-only bootstrap
-this paragraph used to describe is done. `fancy-term-host` consumes it as an
-optional dependency at `>=0.1.1 <2.0`, which means a consumer taking
-`fancy-term-host` resolves whatever the newest `0.1.x` is — so a release here
-reaches terminal users without them upgrading anything. Check what they actually
+**Published.** `@particle-academy/fancy-pty` is on npm (read `latest` with
+`npm view @particle-academy/fancy-pty dist-tags`; no version is typed here,
+because the one that was went stale), and CI publishes by tag over OIDC.
+`fancy-term-host` consumes it as an optional dependency at `>=0.1.1 <2.0`, which
+means a consumer taking `fancy-term-host` resolves the newest release below
+2.0 — so a release here reaches terminal users without them upgrading anything. Check what they actually
 resolve before claiming a fix has landed for them.
