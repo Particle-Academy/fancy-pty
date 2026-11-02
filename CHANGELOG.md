@@ -8,6 +8,8 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-02
+
 ### Fixed
 
 - **Linux and macOS: the shell no longer inherits the helper's other file
