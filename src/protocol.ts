@@ -17,6 +17,8 @@
  * defect class we would be inventing for ourselves.
  */
 
+import path from "node:path";
+
 /** JS -> helper. `Spawn` must be the first frame, and there is exactly one. */
 export const enum Request {
     Spawn = 0x00,
@@ -100,8 +102,71 @@ export interface SpawnRequest {
      * injection.** `argv[0]` stays the program name and is quoted for you if it
      * has whitespace, so it cannot resolve to the wrong program (unlike Node's,
      * it is not sent raw); a `"` in it is refused. See the README.
+     *
+     * It is also what lifts the refusal of a `.cmd` or `.bat` argument that
+     * `cmd.exe` would act on. On POSIX, where it is otherwise ignored, it lifts
+     * that refusal too.
      */
     windowsVerbatimArguments?: boolean;
+}
+
+/**
+ * Would Windows run this program through `cmd.exe`? Judged from the name, so the
+ * answer is the same on every OS.
+ *
+ * Normalised first, because Windows does: `x.cmd.`, `x.cmd `, `x.cmd\.` and
+ * `x.cmd\y\..` all run `x.cmd`, and a plain suffix check passes every one of them.
+ * The helper makes the same call on Windows from the path it actually resolved,
+ * which is the authority. This one exists so a developer on any OS finds out, and
+ * so nothing starts on a request that is going to be refused.
+ */
+export function isBatchProgram(program: string): boolean {
+    const name = path.win32.normalize(program).replace(/[\\/. ]+$/, "");
+    return /\.(cmd|bat)$/i.test(name);
+}
+
+/** What `cmd.exe` acts on in an argument, each one measured. See the README. */
+const CMD_ACTS_ON = /[&|<>^%"!\r\n]/;
+
+/** Printable ASCII only, cut to `limit`: an error must not carry someone's text whole. */
+function preview(text: string, limit: number): string {
+    const chars = Array.from(text);
+    const shown = chars
+        .slice(0, limit)
+        .map((c) => (c >= " " && c <= "~" ? c : "?"))
+        .join("");
+    return chars.length > limit ? `"${shown}..."` : `"${shown}"`;
+}
+
+/**
+ * Why this request must be refused, or `null` if it is fine.
+ *
+ * Windows runs a `.cmd` or `.bat` as `cmd.exe /c <line>` whatever the caller asked
+ * for, and `cmd.exe` parses that line itself, so an `&` in an argument runs a second
+ * command. On Linux and macOS a `.cmd` is not a batch file and has no such risk: it
+ * is refused there too so that code behaves the same everywhere, and a developer on
+ * a Mac finds this before it reaches a Windows user. The helper has the same check
+ * and the same wording, `batch_argument_refusal` in `native/helper.rs`.
+ *
+ * `windowsVerbatimArguments` is exempt: the caller owns the quoting there.
+ */
+export function batchArgumentRefusal(argv: string[], verbatim?: boolean): string | null {
+    const [program = "", ...args] = argv;
+    if (verbatim === true || !isBatchProgram(program)) return null;
+    for (const [i, arg] of args.entries()) {
+        const found = CMD_ACTS_ON.exec(arg)?.[0];
+        if (found === undefined) continue;
+        const what = found === "\n" ? "a line feed" : found === "\r" ? "a carriage return" : `"${found}"`;
+        return (
+            `fancy-pty: refusing to start the batch file ${preview(program, 60)}: ` +
+            `argv[${i + 1}] (${preview(arg, 12)}) contains ${what}, which cmd.exe acts on. ` +
+            `Windows runs every .cmd and .bat through cmd.exe, so this argument could run another command. ` +
+            `Refused on every OS, so the same code behaves the same everywhere. ` +
+            `Pass plain arguments, or set windowsVerbatimArguments: true and quote it yourself, ` +
+            `and never with text you did not write.`
+        );
+    }
+    return null;
 }
 
 /** SPAWN's `[flags: u32 LE]` trailer. See `native/proto.md`. */

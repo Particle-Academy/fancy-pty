@@ -52,6 +52,42 @@ the system's, whatever folder your app happens to be running in.
 
 On Linux and macOS, `argv[0]` goes to `execvp`, which uses `PATH` from `env`.
 
+## Arguments to a `.cmd` or `.bat` are refused if `cmd.exe` would act on them
+
+Windows runs every `.cmd` and `.bat` as `cmd.exe /c <line>`, whatever you asked for,
+and `cmd.exe` parses that line itself. No quoting of ours can make that safe: an
+`&` in an argument runs a second command.
+
+So by default `open()` throws, and starts nothing, if the program is a batch file
+and any argument contains one of:
+
+`&` `|` `<` `>` `^` `%` `"` `!`, a line feed, or a carriage return
+
+The error names the argument's position and shows only its first 12 characters.
+
+```ts
+open({ argv: ["npm.cmd", "install", "--save-dev", "a b"] }); // fine
+open({ argv: ["npm.cmd", "run", userText] }); // throws if userText contains any of those
+```
+
+- **What to do.** Plain arguments need nothing: flags, `key=value`, and paths with
+  spaces all work. If you do need one of these characters, set
+  `windowsVerbatimArguments: true` and quote it yourself (see below). Do not do that
+  with text you did not write.
+- **This is the same on every OS, on purpose.** On Linux and macOS a `.cmd` is not a
+  batch file: `argv` goes straight to `execvp` with no shell and the arguments arrive
+  literally, so there is no risk there. It is refused anyway so that code behaves the
+  same everywhere, and a developer on a Mac finds this before a Windows user does.
+  `windowsVerbatimArguments: true` lifts it on those platforms too, and changes
+  nothing else there.
+- **"A batch file" is judged by name, however it is spelled.** Case does not matter,
+  and neither do the trailing dots and spaces Windows strips. On Windows the helper
+  checks again on the path it resolved, and reports the same message through
+  `onError`.
+- **Any other program is unaffected.** An `.exe` gets its arguments literally and
+  nothing parses them for it. That includes `cmd.exe /c <text>`, where you chose the
+  shell: see the warning below.
+
 ## Running a shell line on Windows
 
 `argv` is a list, and by default the helper quotes it into a command line by the
@@ -75,7 +111,8 @@ open({ argv: ["cmd.exe", "/d", "/s", "/c", `"${line}"`], windowsVerbatimArgument
 > make it safe: the value can contain a `"` that closes your quotes. If you have
 > a program and a list of arguments, use the default mode, which needs no quoting
 > from you and starts no shell. The exception is a `.cmd` or `.bat`: Windows always
-> runs one through `cmd.exe`, in either mode, so pass it only values you wrote.
+> runs one through `cmd.exe`, in either mode. The default mode refuses the arguments
+> `cmd.exe` would act on; this option turns that off, so pass it only values you wrote.
 
 - **Outer quotes matter, and leaving them off can run the wrong program.** `/s`
   makes `cmd.exe` remove the first and the last `"` on the line, so

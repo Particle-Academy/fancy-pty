@@ -61,6 +61,13 @@ has whitespace.
 `lpApplicationName` is NULL and element 0 on the line is the resolved path, always
 quoted. See `resolve_program` and `batch_command_line` in `helper.rs`.
 
+**The wire is unchanged by the batch-argument refusal.** Without flag bit 0, once a
+program has resolved to a batch file, an argument containing a character `cmd.exe`
+acts on gets `ERROR` then `EXIT 1`, with no `PID` and nothing created. `open()` makes
+the same refusal first, in the same words, on every platform, so a consumer of
+`open()` sees a thrown error and only a direct driver of the helper sees this frame.
+POSIX has no such check: `argv` goes straight to `execvp`.
+
 ### Extending SPAWN
 
 There is no version field. The decoder rejects trailing bytes as version skew,

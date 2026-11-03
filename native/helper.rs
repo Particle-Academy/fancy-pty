@@ -493,6 +493,57 @@ fn is_batch(path: &str) -> bool {
     lower.ends_with(".cmd") || lower.ends_with(".bat")
 }
 
+/// Printable ASCII only, cut to `limit`: an error must not carry someone's text
+/// whole. Same output as `preview` in `src/protocol.ts`.
+fn preview(text: &str, limit: usize) -> String {
+    let shown: String = text
+        .chars()
+        .take(limit)
+        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .collect();
+    if text.chars().count() > limit {
+        format!("\"{shown}...\"")
+    } else {
+        format!("\"{shown}\"")
+    }
+}
+
+/// Why a batch file's arguments must be refused, or `None` if they are fine.
+///
+/// The second layer of `batchArgumentRefusal` in `src/protocol.ts`, with the same
+/// characters and the same words. This one judges the program Windows would
+/// actually start: the caller only reaches it with a path that resolved to a batch
+/// file, whatever the spelling that got there.
+///
+/// Windows runs a `.cmd` or `.bat` as `cmd.exe /c <line>`, and cmd.exe parses that
+/// line itself, so the helper's quoting cannot make these safe. Measured for every
+/// code unit up to U+00FF and some Unicode lookalikes, through a script ignoring its
+/// arguments and one passing `%*` on: these are the ones it acts on. `!` is inert
+/// unless delayed expansion is on (a registry setting, or `/v:on`), and then it
+/// substitutes a variable just as `%` does. Inside quotes `&` waits until a script
+/// says `%~1`, so an argument that gets quoted is refused as well.
+fn batch_argument_refusal(argv: &[String]) -> Option<String> {
+    for (i, arg) in argv.iter().enumerate().skip(1) {
+        let Some(found) = arg
+            .chars()
+            .find(|c| matches!(c, '&' | '|' | '<' | '>' | '^' | '%' | '"' | '!' | '\r' | '\n'))
+        else {
+            continue;
+        };
+        let what = match found {
+            '\n' => "a line feed".to_string(),
+            '\r' => "a carriage return".to_string(),
+            c => format!("\"{c}\""),
+        };
+        return Some(format!(
+            "fancy-pty: refusing to start the batch file {}: argv[{i}] ({}) contains {what}, which cmd.exe acts on. Windows runs every .cmd and .bat through cmd.exe, so this argument could run another command. Refused on every OS, so the same code behaves the same everywhere. Pass plain arguments, or set windowsVerbatimArguments: true and quote it yourself, and never with text you did not write.",
+            preview(&argv[0], 60),
+            preview(arg, 12),
+        ));
+    }
+    None
+}
+
 /// Decide which file a name means, BEFORE anything is created.
 ///
 /// Why this exists: given `lpApplicationName = NULL`, `CreateProcessW` searches
@@ -992,6 +1043,16 @@ fn selftest() {
         "resolve: a quote is not a filename",
     );
 
+    // The batch decision is made on what the name normalised TO, not on the name.
+    let normalised = resolve_program(
+        r"C:\d\x.cmd. ",
+        &[],
+        None,
+        &|p: &str| p == r"C:\d\x.cmd",
+        &|_: &str| Some(r"C:\d\x.cmd".to_string()),
+    );
+    expect(normalised == batch(r"C:\d\x.cmd"), "resolve: a name that normalises to a .cmd is a batch file");
+
     let n = list(&["npm.cmd", "a b", "c"]);
     expect(
         batch_command_line(r"C:\n\npm.cmd", &n, false) == r#""C:\n\npm.cmd" "a b" c"#,
@@ -1017,6 +1078,84 @@ fn selftest() {
         not_found_error(r".\tool.exe").contains("not to the cwd option"),
         "not found: a directory part gets its own rule",
     );
+
+    let refuse = |args: &[&str]| {
+        let mut argv = vec!["x.cmd"];
+        argv.extend_from_slice(args);
+        batch_argument_refusal(&list(&argv))
+    };
+    for (arg, what) in [
+        ("a&b", "\"&\""),
+        ("a|b", "\"|\""),
+        ("a<b", "\"<\""),
+        ("a>b", "\">\""),
+        ("a^b", "\"^\""),
+        ("%PATH%", "\"%\""),
+        ("a\"b", "\"\"\""),
+        ("!PATH!", "\"!\""),
+        ("a\nb", "a line feed"),
+        ("a\rb", "a carriage return"),
+    ] {
+        let why = refuse(&[arg]).unwrap_or_default();
+        expect(why.contains(&format!("contains {what},")), "batch args: each character is refused, by name");
+    }
+    expect(refuse(&["a b&c"]).is_some(), "batch args: also inside an argument that would be quoted");
+    let why = refuse(&["fine", "a b", "a&b", "c|d"]).unwrap_or_default();
+    expect(why.contains("argv[3]") && !why.contains("argv[4]"), "batch args: names the first position at fault");
+    expect(
+        why.starts_with("fancy-pty: refusing to start the batch file \"x.cmd\":")
+            && why.contains("cmd.exe")
+            && why.contains("windowsVerbatimArguments")
+            && why.contains("every OS"),
+        "batch args: says why and what to do",
+    );
+    let long = refuse(&["abcdefghijkl-mnopqrstuvwxyz-&-TAIL"]).unwrap_or_default();
+    expect(long.contains("\"abcdefghijkl...\"") && !long.contains("TAIL"), "batch args: the argument is cut short");
+    let raw = refuse(&["a\u{1b}]0;x\nb"]).unwrap_or_default();
+    expect(raw.contains("\"a?]0;x?b\"") && !raw.chars().any(|c| c < ' '), "batch args: no control character is printed");
+    expect(refuse(&["--version"]).is_none(), "batch args: a flag is fine");
+    expect(refuse(&["a b", r"C:\Program Files\x y\f.txt"]).is_none(), "batch args: spaces and paths are fine");
+    expect(refuse(&["key=value", "a,b", "a;b", "a(b)c", "a b\\"]).is_none(), "batch args: the rest of the measured-safe set is fine");
+    expect(refuse(&["\u{ff06}", "\u{ff5c}", "caf\u{e9}"]).is_none(), "batch args: Unicode lookalikes are inert");
+    expect(refuse(&[]).is_none(), "batch args: no arguments, nothing to refuse");
+
+    expect(is_batch(r"C:\d\x.cmd") && is_batch(r"C:\d\x.bat"), "is_batch: .cmd and .bat");
+    expect(is_batch(r"C:\d\X.CMD") && is_batch(r"C:\d\x.Bat"), "is_batch: in any case");
+    expect(is_batch(r"C:\d\OTHER~1.CMD"), "is_batch: a short name, which is what a .cmdx has");
+    expect(
+        !is_batch(r"C:\d\x.cmdx") && !is_batch(r"C:\d\x.cmd.exe") && !is_batch(r"C:\d\xcmd"),
+        "is_batch: not a lookalike long name",
+    );
+
+    // THE REAL GetFullPathNameW, which only computes a string: it starts nothing and
+    // opens nothing, which is why these live here and not in lookup.live.mjs. A live
+    // check on a lookalike can reach cmd.exe's shell hand-off and open a dialog on
+    // the desktop. Each of these names the same file as C:\d\x.cmd, and is_batch
+    // only ever sees the normalised form.
+    #[cfg(windows)]
+    for spelling in [
+        r"C:\d\x.cmd.",
+        r"C:\d\x.cmd...",
+        r"C:\d\x.cmd ",
+        r"C:\d\x.cmd   ",
+        r"C:\d\x.cmd .",
+        r"C:\d\x.cmd. ",
+        r"C:\d\x.cmd\.",
+        r"C:\d\x.cmd/.",
+        r"C:\d\x.cmd\y\..",
+        r"C:\d\x.cmd/y/..",
+        r"C:\d\x.cmd\y\z\..\..",
+        r"C:\d\x.cmd .\y\..",
+        r"C:\d\x.cmd. \.",
+        r"C:\d\y\..\x.cmd",
+        r"C:/d/x.cmd",
+    ] {
+        let full = win::full_path(spelling);
+        expect(
+            full.as_deref() == Some(r"C:\d\x.cmd") && is_batch(full.as_deref().unwrap_or("")),
+            "full path: a spelling Windows normalises is judged as the batch file it names",
+        );
+    }
 
     expect(env_block(&[]) == [0u16, 0], "env block: an empty one is two NULs");
     expect(
@@ -1260,7 +1399,7 @@ mod win {
     }
 
     /// Absolute, against this process's current directory, which is the host's.
-    fn full_path(path: &str) -> Option<String> {
+    pub fn full_path(path: &str) -> Option<String> {
         let path = wide(path);
         unsafe {
             let need = GetFullPathNameW(path.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut());
@@ -1397,7 +1536,16 @@ mod win {
         // is nothing to search for: see `batch_command_line`.
         let (application, command) = match resolved {
             Program::Image(path) => (Some(wide(&path)), command),
-            Program::Batch(path) => (None, batch_command_line(&path, &req.argv, req.windows_verbatim)),
+            Program::Batch(path) => {
+                // After resolution, because only then is it known to be a batch
+                // file. Before anything is created, so a refusal starts nothing.
+                if !req.windows_verbatim {
+                    if let Some(why) = batch_argument_refusal(&req.argv) {
+                        return Err(why);
+                    }
+                }
+                (None, batch_command_line(&path, &req.argv, req.windows_verbatim))
+            }
         };
         unsafe {
             // RE-ENABLE Ctrl-C before creating the command, or F4's graceful

@@ -8,6 +8,27 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+### Security
+
+- **A `.cmd` or `.bat` is refused if an argument contains a character `cmd.exe` acts
+  on.** Windows runs every batch file as `cmd.exe /c <line>`, and on every earlier
+  release an unquoted `&` in an argument ran a second command. Any app passing text it
+  did not write to a batch file was open to this. Node refuses such spawns outright for
+  the same reason (CVE-2024-27980).
+
+  The characters are `&` `|` `<` `>` `^` `%` `"` `!`, line feed and carriage return.
+  `open()` throws before anything starts, on every OS. The helper checks again on
+  Windows, on the path it resolved. On Linux and macOS a `.cmd` is not a batch file and
+  has no such risk: `execvp` starts no shell, and the argument arrives literally. It is
+  refused there for consistency only, so a developer on a Mac finds this before a
+  Windows user does.
+
+  **BREAKING, for a few callers.** If you pass one of those characters to a batch file,
+  `open()` now throws. If you need that, set `windowsVerbatimArguments: true` and quote
+  the argument yourself, which also lifts the refusal on Linux and macOS. Plain arguments
+  need nothing: flags, `key=value` and paths with spaces all work as before, and any
+  program that is not a batch file is unaffected.
+
 ### Fixed
 
 - **Windows: a pty with no environment variables now starts.** `env: {}`, and

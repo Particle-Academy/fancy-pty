@@ -190,6 +190,31 @@ exactly like a batch file that cannot start: no output, exit 1. It was a tie on
 the dev machine (query about 25 ms, batch about 30 ms) and lost on a CI runner.
 Check `7a` uses a script that takes a second, so this goes red on any machine.
 
+### A batch file's arguments
+
+`cmd.exe` parses a batch file's line itself, so default mode refuses an argument
+containing `& | < > ^ % " !`, LF or CR. Two layers, same words:
+`batchArgumentRefusal` in `src/protocol.ts`, called by `open()` on every OS, and
+`batch_argument_refusal` in `helper.rs`, on the path `resolve_program` resolved.
+It is deliberately NOT in `encodeSpawn`: that would stop the live suite reaching the
+helper's layer at all.
+
+The set is measured, not copied: every code unit to U+00FF and some Unicode lookalikes,
+through a script ignoring its arguments and one passing `%*`. `!` is inert unless
+delayed expansion is on. The JS normaliser matches what starts on Windows: `x.cmd.`,
+`x.cmd\.` and `x.cmd\y\..` all do, and a suffix check passes them all.
+
+**NEVER hand a lookalike name to a live check.** `.cmd` and `.bat` are judged by name,
+and `cmd.exe` judges again by the real file. The 8.3 name of `other.cmdx` is
+`OTHER~1.CMD`: the helper sends it to `cmd.exe`, which passes the real type to the
+shell association, and an unregistered extension opens the "Select an app" dialog on
+the desktop of whoever is running the suite. `windowsHide` does not cover that. This
+happened. So trailing dots and spaces, streams, device prefixes and short names are
+tested only where nothing launches: `--selftest`, which uses the real
+`GetFullPathNameW`, and `src/__tests__/batch-arguments.test.ts`. A live check uses real
+`.exe`, `.cmd` and `.bat` files under ordinary names, and that holds under sabotage,
+when a refusal is gone and the file really is started.
+
 ## Testing
 
 ```

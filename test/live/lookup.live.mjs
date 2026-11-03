@@ -31,7 +31,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { encodeSpawn, frame, FrameDecoder, helperPath } from "../../dist/index.js";
+import { encodeSpawn, frame, FrameDecoder, helperPath, open } from "../../dist/index.js";
 
 if (process.platform !== "win32") {
     console.log("lookup.live: Windows only, nothing to run here");
@@ -162,7 +162,7 @@ try {
         helperEnv.PATH = o.helperPathVar ?? pathOf();
         if (o.helperVarSet) helperEnv[VAR] = "1";
         if (o.helperPathVar === null) delete helperEnv.PATH;
-        const childEnv = o.childEnvExact ?? { ...baseEnv(), PATH: o.childPathVar ?? pathOf(onPath), FANCY_PTY_ECHO_OUT: out };
+        const childEnv = o.childEnvExact ?? { ...baseEnv(), PATH: o.childPathVar ?? pathOf(onPath), FANCY_PTY_ECHO_OUT: out, ...o.childExtra };
 
         const child = spawn(o.helper ?? helperPlain, [], {
             stdio: ["pipe", "pipe", "pipe"],
@@ -225,6 +225,8 @@ try {
         result.batch = existsSync(`${out}.batch`)
             ? readFileSync(`${out}.batch`, "utf8").trim().split(/\r?\n/)
             : [];
+        // Written only by a second command, never by the script the spawn named.
+        result.marked = existsSync(`${out}.mark`);
         result.ran = result.records[0]?.exe ?? result.image;
         return result;
     }
@@ -444,6 +446,180 @@ try {
         expectMissing(missingAbs, "a missing absolute path");
         ok(missingAbs.errors.join("; ").includes("gone.exe"), "and it names the program");
         expectMissing(await go({ argv: [""] }), "an empty program name");
+    }
+
+    // ---------------------------------- a batch file's arguments reach cmd.exe
+    console.log("\n--- arguments cmd.exe would act on ---");
+    writeFileSync(path.join(onPath, "fplmark.cmd"), '@echo off\r\n>>"%FANCY_PTY_ECHO_OUT%.mark" echo MARK\r\n');
+    // Hands %* to a child, the way npm.cmd does, so cmd.exe parses them a second
+    // time and the child reports what survived.
+    writeFileSync(path.join(onPath, "fplrelay.cmd"), '@"%FPL_ECHO%" %*\r\n');
+    const relay = path.join(onPath, "fplrelay.cmd");
+    const FAMILY = "refusing to start the batch file";
+    const sideDir = dir("side effects");
+    const sideFile = path.join(sideDir, "fplside.txt");
+    const pathed = { helperPathVar: pathOf(onPath) };
+
+    /** The helper refused it: an ERROR, then EXIT 1, and nothing was started. */
+    const expectRefused = (r, what, position = "argv[1]") => {
+        ok(
+            r.pid === null && r.code === 1 && r.batch.length === 0 && r.records.length === 0 && !r.marked && r.errors.length === 1,
+            `${what}: nothing started (pid ${r.pid}, exit ${r.code}, second command ${r.marked ? "RAN" : "did not run"})`,
+        );
+        const text = r.errors.join("; ");
+        ok(text.includes(FAMILY) && text.includes(position) && text.includes("windowsVerbatimArguments"), `${what}: the error says why, where and what to do (${text.slice(0, 40)})`);
+    };
+
+    console.log("9. the instrument: in verbatim mode, where the caller owns the quoting");
+    const firing = await run({ argv: [absBatch, "a&fplmark.cmd"], verbatim: true });
+    ok(firing.marked && batchWas(firing, "GOOD-PATH"), `verbatim is NOT refused, and the second command runs: the marker can fire (${firing.errors.join("; ").slice(0, 50) || "ran"})`);
+    const firingBare = await run({ argv: ["fplbatch.cmd", "a&fplmark.cmd"], verbatim: true, ...pathed });
+    ok(firingBare.marked, "so does a bare one");
+    const firingQuoted = await run({ argv: [absBatch, `${q}a&b c${q}`], verbatim: true });
+    ok(!firingQuoted.marked && batchWas(firingQuoted, "GOOD-PATH"), "and text the caller quoted itself goes through");
+
+    console.log("10. each character, to an absolute and to a bare .cmd");
+    const ATTACKS = [
+        ["&", "a&fplmark.cmd"],
+        ["&, inside an argument that gets quoted", "a b&fplmark.cmd"],
+        ["|", "a|fplmark.cmd"],
+        [">", `a>${sideFile}`],
+        ["<", `a<${absBatch}`],
+        ["^", "a^b"],
+        ["%", "%FPL_V%"],
+        ["%, holding a command", "a %FPL_HOSTILE% b"],
+        ["a quote closing the helper's own", 'a b" & fplmark.cmd & "c'],
+        ["a quote, no space", 'a"&fplmark.cmd&"c'],
+        ["!", "!FPL_V!"],
+        ["line feed", "a\nfplmark.cmd"],
+        ["carriage return", "a\rfplmark.cmd"],
+    ];
+    const attackEnv = { FPL_V: "VALUE", FPL_HOSTILE: 'x"&fplmark.cmd&"y' };
+    for (const [what, arg] of ATTACKS) {
+        expectRefused(await run({ argv: [absBatch, arg], childExtra: attackEnv, cwd: sideDir }), `absolute .cmd, ${what}`);
+        expectRefused(await run({ argv: ["fplbatch.cmd", arg], childExtra: attackEnv, cwd: sideDir, ...pathed }), `bare .cmd, ${what}`);
+    }
+    ok(!existsSync(sideFile), "no redirect created a file");
+    expectRefused(await run({ argv: [absBatch, "ok", "still ok", "a&fplmark.cmd"] }), "the third argument", "argv[3]");
+    const longArg = `${"x".repeat(40)}&SECRET-TAIL`;
+    const longRefused = await run({ argv: [absBatch, longArg] });
+    expectRefused(longRefused, "a long argument");
+    ok(!longRefused.errors.join("").includes("SECRET-TAIL") && !longRefused.errors.join("").includes("x".repeat(13)), "the error carries only the start of it");
+
+    console.log("11. every spelling that reaches cmd.exe");
+    // ONLY REAL .cmd AND .bat FILES HERE, under ordinary spellings. Do not add a
+    // lookalike: cmd.exe hands a file it does not recognise to the shell association,
+    // and an unregistered extension then opens the "Select an app" dialog on the
+    // desktop of whoever is running this. `windowsHide` does not cover that. It did
+    // exactly that from here once, through the 8.3 name of a `.cmdx`. Trailing dots
+    // and spaces, stream names, `\\?\` and short names are checked without launching
+    // anything: `--selftest` (real GetFullPathNameW) and batch-arguments.test.ts.
+    const upper = path.join(onPath, "fplupper.CMD");
+    const mixed = path.join(onPath, "fplmixed.Bat");
+    writeFileSync(upper, batchBody("GOOD-PATH"));
+    writeFileSync(mixed, batchBody("GOOD-PATH"));
+    const SPELLINGS = [
+        ["upper case", upper],
+        ["mixed case", mixed],
+        ["through a directory", path.join(onPath, "sub") + "\\..\\fplbatch.cmd"],
+        ["forward slashes", absBatch.replaceAll("\\", "/")],
+        ["bare, upper case", "FPLBATCH.CMD"],
+    ];
+    // A planted name is worth nothing unless that spelling really does start the
+    // script, so each one first has to be seen doing it with a plain argument.
+    for (const [what, program] of SPELLINGS) {
+        const plainRun = await run({ argv: [program, "plain"], ...pathed });
+        ok(batchWas(plainRun, "GOOD-PATH"), `${what}: control, it does start the script (${plainRun.batch[0]?.slice(0, 30) ?? plainRun.errors.join("; ").slice(0, 60)})`);
+        expectRefused(await run({ argv: [program, "a&fplmark.cmd"], ...pathed }), `${what}, with &`);
+    }
+    expectRefused(await run({ argv: [".\\fplbatch.cmd", "a&fplmark.cmd"], hostCwd: onPath }), "relative, with &");
+
+    console.log("12. plain arguments still work");
+    const relayArgs = (r) => r.records[0]?.argv.slice(1);
+    for (const args of [
+        ["--version"],
+        ["install"],
+        ["a b", "c"],
+        ["C:\\Program Files\\some dir\\file.txt"],
+        ["key=value", "a,b", "a;b"],
+        ["a(b)c"],
+        ["a b\\"],
+        ["caf\u00e9", "\uff06", "\uff5c"],
+        [],
+    ]) {
+        const r = await run({ argv: [relay, ...args], childExtra: { FPL_ECHO: fixture } });
+        ok(
+            r.errors.length === 0 && r.records.length === 1 && JSON.stringify(relayArgs(r)) === JSON.stringify(args),
+            `${JSON.stringify(args)} arrives whole, through %* (${JSON.stringify(relayArgs(r)) ?? r.errors.join("; ").slice(0, 60)})`,
+        );
+    }
+    const barePlain = await run({ argv: ["fplrelay.cmd", "a b"], childExtra: { FPL_ECHO: fixture }, ...pathed });
+    ok(JSON.stringify(relayArgs(barePlain)) === '["a b"]', `and through a bare .cmd (${JSON.stringify(relayArgs(barePlain))})`);
+
+    const npmDir = ambientPath.find((d) => existsSync(path.join(d, "npm.cmd")));
+    ok(npmDir !== undefined, `npm.cmd is on PATH to test with (${npmDir})`);
+    if (npmDir) {
+        // A line of its own once ConPTY's sequences are gone. The window title is
+        // one of them, and it can hold a version from the program's own path.
+        const versionIn = (text) =>
+            /^\s*(\d+\.\d+\.\d+)\s*$/m.exec(text.replace(/\x1b\][^\x07]*\x07/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "\n"))?.[1];
+        const bareNpm = await run({ argv: ["npm.cmd", "--version"], childPathVar: pathOf() });
+        ok(bareNpm.code === 0 && versionIn(bareNpm.text) !== undefined, `the real npm.cmd --version (exit ${bareNpm.code}, ${versionIn(bareNpm.text)})`);
+        const absNpm = await run({ argv: [path.join(npmDir, "npm.cmd"), "--version"], childPathVar: pathOf() });
+        ok(absNpm.code === 0 && versionIn(absNpm.text) !== undefined, `and by its full path (exit ${absNpm.code}, ${versionIn(absNpm.text)})`);
+    }
+
+    // The default-mode rule is about cmd.exe, so nothing else may be caught by it.
+    const hostileToImage = ["a&b", "%PATH%", 'c"d', "e|f", "g^h", "!i!"];
+    const image = await run({ argv: [fixture, ...hostileToImage] });
+    ok(
+        image.records.length === 1 && JSON.stringify(image.records[0].argv.slice(1)) === JSON.stringify(hostileToImage),
+        `an image takes the same characters literally and is not refused (${JSON.stringify(image.records[0]?.argv.slice(1)) ?? image.errors.join("; ")})`,
+    );
+
+    console.log("13. through open(): refused in JS, before a helper exists");
+    const opened = (argv, extra = {}) => {
+        const out = path.join(root, `out-${runs++}.jsonl`);
+        try {
+            const pty = open({
+                helper: helperPlain,
+                argv,
+                cols: 120,
+                rows: 30,
+                env: { ...baseEnv(), PATH: pathOf(onPath), FANCY_PTY_ECHO_OUT: out },
+                ...extra,
+            });
+            const errors = [];
+            pty.onError((e) => errors.push(e.message));
+            pty.onData(() => {});
+            return { out, errors, exit: new Promise((res) => pty.onExit(res)) };
+        } catch (e) {
+            return { out, thrown: e };
+        }
+    };
+    const thrown = opened([absBatch, "a&fplmark.cmd"]);
+    ok(thrown.thrown?.message.includes(FAMILY) === true, `open() throws synchronously (${thrown.thrown?.message.slice(0, 40) ?? "it did not throw"})`);
+    if (thrown.exit) {
+        // Only when the JS check is gone, and then this says which layer caught it.
+        await thrown.exit;
+        console.log(`  note open() returned, so the helper is what answered: ${thrown.errors.join("; ").slice(0, 60)}`);
+    }
+    ok(!existsSync(`${thrown.out}.mark`) && !existsSync(`${thrown.out}.batch`), "and nothing ran");
+    const direct = await run({ argv: [absBatch, "a&fplmark.cmd"] });
+    ok(thrown.thrown?.message === direct.errors[0], "and it is word for word what the helper says for the same request");
+    for (const [what, program] of SPELLINGS) {
+        const s = opened([program, "a&fplmark.cmd"]);
+        ok(s.thrown?.message.includes(FAMILY) === true, `open() throws for: ${what}`);
+        if (s.exit) await s.exit;
+    }
+    const plainOpen = opened([absBatch, "a b"]);
+    ok(!plainOpen.thrown, "open() with a plain argument does not throw");
+    if (plainOpen.exit) ok((await plainOpen.exit) === 7 && existsSync(`${plainOpen.out}.batch`), "and the script runs and exits 7");
+    const verbatimOpen = opened([absBatch, "a&fplmark.cmd"], { windowsVerbatimArguments: true });
+    ok(!verbatimOpen.thrown, "open() in verbatim mode does not throw");
+    if (verbatimOpen.exit) {
+        await verbatimOpen.exit;
+        ok(existsSync(`${verbatimOpen.out}.mark`), "and that request does what the caller wrote: the second command runs");
     }
 
     // ------------------------------------------------------- an empty environment

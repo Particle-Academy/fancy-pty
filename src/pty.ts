@@ -7,6 +7,7 @@ import {
     FrameDecoder,
     Request,
     Response,
+    batchArgumentRefusal,
     decodeKilled,
     encodeKill,
     encodeResize,
@@ -101,6 +102,8 @@ export function open(options: PtyOptions): Pty {
     // spawn threw with a helper left blocked on its first frame, and no `Pty`
     // for the caller to kill it with.
     const spawnFrame = frame(Request.Spawn, encodeSpawn(options));
+    const refusal = batchArgumentRefusal(options.argv, options.windowsVerbatimArguments);
+    if (refusal) throw new Error(refusal);
 
     const exe = options.helper ?? helperPath();
 

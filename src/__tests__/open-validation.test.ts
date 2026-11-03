@@ -57,4 +57,26 @@ describe("open() validates before it starts a helper", () => {
         ).toThrow(/must be a boolean/);
         expect(spawned.count).toBe(0);
     });
+
+    it("starts none for a batch file with an argument cmd.exe would act on", () => {
+        expect(() => open({ helper, argv: ["x.cmd", "a&b"] })).toThrow(
+            /refusing to start the batch file "x\.cmd": argv\[1\]/,
+        );
+        expect(spawned.count).toBe(0);
+    });
+
+    it("control: the same batch file with a plain argument does start one", () => {
+        open({ helper, argv: ["x.cmd", "a b"] });
+        expect(spawned.count).toBe(1);
+    });
+
+    it("control: the same argument in verbatim mode does start one", () => {
+        open({ helper, argv: ["x.cmd", "a&b"], windowsVerbatimArguments: true });
+        expect(spawned.count).toBe(1);
+    });
+
+    it("control: the same argument to a program that is not a batch file does start one", () => {
+        open({ helper, argv: ["x.exe", "a&b"] });
+        expect(spawned.count).toBe(1);
+    });
 });

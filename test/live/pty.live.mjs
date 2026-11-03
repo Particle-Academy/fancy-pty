@@ -585,6 +585,113 @@ console.log("\n6f. a pty with no environment variables at all still starts");
     }
 }
 
+// ------------------------------------ 6g. a .cmd's arguments, on every platform
+console.log("\n6g. a batch file with an argument cmd.exe acts on is refused, on every OS");
+{
+    const hostile = "a&b";
+    // No file by any of these names exists. Lookalike spellings (trailing dots and
+    // spaces) stay in batch-arguments.test.ts, which launches nothing.
+    for (const program of ["x.cmd", "x.bat", "X.CMD", "x.Bat", "./x.cmd", "/no/such/x.cmd"]) {
+        let thrown;
+        try {
+            collect(open({ argv: [program, hostile], env: process.env }));
+        } catch (e) {
+            thrown = e;
+        }
+        ok(
+            /refusing to start the batch file/.test(thrown?.message ?? "") && thrown.message.includes("argv[1]"),
+            `${JSON.stringify(program)}: open() throws (${thrown?.message.slice(0, 45) ?? "it did not throw"})`,
+        );
+    }
+    // Reaches the helper, which reports a missing program: the point is only that
+    // the rule let it through.
+    for (const [what, argv, options] of [
+        ["a plain argument", ["/no/such/x.cmd", "a b"], {}],
+        ["verbatim mode", ["/no/such/x.cmd", hostile], { windowsVerbatimArguments: true }],
+    ]) {
+        const c = collect(open({ argv, env: process.env, ...options }));
+        await withTimeout(c.exit, 15000);
+        const text = c.errors.map((e) => e.message).join("; ");
+        ok(!/refusing/.test(text), `${what} is not refused (${text.slice(0, 60)})`);
+    }
+}
+
+// ----------------------------------- 6h. does POSIX have its own version of this?
+if (!isWindows) {
+    console.log("\n6h. POSIX: execvp starts no shell, so a hostile argument arrives literally");
+    const { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const path = await import("node:path");
+    const root = mkdtempSync(path.join(tmpdir(), "fancy-pty-posix-args-"));
+    try {
+        const marker = path.join(root, "marker");
+        const out = path.join(root, "out");
+        const go = async (argv, options = {}) => {
+            rmSync(out, { force: true });
+            const c = collect(open({ argv, env: { ...process.env, FPL_OUT: out }, ...options }));
+            const code = await withTimeout(c.exit, 15000);
+            return { code, errors: c.errors };
+        };
+        const received = () => (existsSync(out) ? readFileSync(out, "utf8").split("\0").slice(0, -1) : null);
+
+        // The positive control: the same text, given to a shell, does run the marker.
+        await go(["/bin/sh", "-c", `a;touch ${marker}`]);
+        ok(existsSync(marker), "control: this text run by a shell does create the marker");
+        rmSync(marker, { force: true });
+
+        const recorder = "printf '%s\\0' \"$@\" > \"$FPL_OUT\"\n";
+        const scripts = [
+            ["a script with a shebang", "with-shebang.sh", `#!/bin/sh\n${recorder}`],
+            ["a script with no shebang (execvp falls back to sh)", "no-shebang.sh", recorder],
+        ];
+        const hostileArgs = [
+            `a&touch ${marker}`,
+            `a;touch ${marker}`,
+            `a|touch ${marker}`,
+            `$(touch ${marker})`,
+            `\`touch ${marker}\``,
+            `a\ntouch ${marker}`,
+            `a>${marker}`,
+            `a"b'c`,
+            "%PATH%",
+            "$PATH",
+            "!x!",
+            "*",
+            "~",
+        ];
+        for (const [what, name, body] of scripts) {
+            const file = path.join(root, name);
+            writeFileSync(file, body);
+            chmodSync(file, 0o755);
+            const r = await go([file, ...hostileArgs]);
+            ok(r.code === 0 && r.errors.length === 0, `${what} runs (exit ${r.code})`);
+            ok(JSON.stringify(received()) === JSON.stringify(hostileArgs), `${what}: every argument arrives byte for byte`);
+            ok(!existsSync(marker), `${what}: nothing else ran`);
+        }
+
+        // A .cmd here is not a batch file at all. It is refused for consistency, so
+        // the same code behaves the same on every OS, and not because of a risk:
+        // verbatim mode shows the same request is harmless here.
+        const named = path.join(root, "really-a-shell-script.cmd");
+        writeFileSync(named, `#!/bin/sh\n${recorder}`);
+        chmodSync(named, 0o755);
+        const plain = await go([named, "a b"]);
+        ok(plain.code === 0 && JSON.stringify(received()) === '["a b"]', "a .cmd with a plain argument runs, as the script it is");
+        let refused;
+        try {
+            await go([named, `a&touch ${marker}`]);
+        } catch (e) {
+            refused = e;
+        }
+        ok(/refusing/.test(refused?.message ?? ""), "the same .cmd with & is refused, for consistency");
+        const flagged = await go([named, `a&touch ${marker}`], { windowsVerbatimArguments: true });
+        ok(flagged.code === 0 && JSON.stringify(received()) === JSON.stringify([`a&touch ${marker}`]), "with the option it runs, and the argument is literal");
+        ok(!existsSync(marker), "and nothing else ran");
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+}
+
 // --------------------------------------------------------- 7. THE BAR
 console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
 {

@@ -204,6 +204,12 @@ jobs:
       - name: Build the JS
         run: npx tsup
 
+      # The batch-argument refusal is meant to say the same thing on every OS, and
+      # the `unit` job above only runs on Linux. Pure, and it starts nothing.
+      - name: Batch-argument rule (every OS)
+        if: matrix.live
+        run: npx vitest run src/__tests__/batch-arguments.test.ts
+
       # Diagnostic, before the live suite, and NOT gated on the live suite
       # passing -- the whole reason it exists is that the live suite only says
       # "ENOTTY" and cannot say which of two causes produced it. Running it on
