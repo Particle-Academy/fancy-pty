@@ -389,7 +389,8 @@ rather than rounding four green platforms up to six.
 **Published.** `@particle-academy/fancy-pty` is on npm (read `latest` with
 `npm view @particle-academy/fancy-pty dist-tags`; no version is typed here,
 because the one that was went stale), and CI publishes by tag over OIDC.
-`fancy-term-host` consumes it as an optional dependency at `>=0.1.1 <2.0`, which
-means a consumer taking `fancy-term-host` resolves the newest release below
-2.0 — so a release here reaches terminal users without them upgrading anything. Check what they actually
-resolve before claiming a fix has landed for them.
+`fancy-term-host` declares it as a real dependency, and both its backends run on
+it since 0.13.0. Its range has no caret, so a new install resolves the newest
+release here without that package shipping. An existing lockfile does not move.
+Read that package's `package.json` for the range rather than typing it here, and
+check what a consumer actually resolves before claiming a fix has landed for them.
