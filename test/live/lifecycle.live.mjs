@@ -85,7 +85,7 @@ function processTable() {
                 "-Command",
                 "Get-CimInstance Win32_Process | ForEach-Object { '{0},{1},{2}' -f $_.ProcessId,$_.ParentProcessId,$_.Name }",
             ],
-            { encoding: "utf8" },
+            { encoding: "utf8", windowsHide: true },
         );
         return out
             .split(/\r?\n/)
@@ -254,6 +254,7 @@ console.log("\nF1. ten ptys do not outlive a controller that is killed outright"
     const dir = tempDir("f1");
     const ctl = spawn(process.execPath, [controllerScript, dir, String(N)], {
         stdio: ["ignore", "pipe", "inherit"],
+        windowsHide: true,
     });
     const line = await new Promise((res) => {
         let buf = "";
@@ -284,7 +285,7 @@ console.log("\nF1. ten ptys do not outlive a controller that is killed outright"
 
     // Outright: no signal handler runs, nothing gets to say goodbye. This is
     // the shape of a crash, not of a quit.
-    if (isWindows) execFileSync("taskkill", ["/F", "/PID", String(ctl.pid)], { stdio: "ignore" });
+    if (isWindows) execFileSync("taskkill", ["/F", "/PID", String(ctl.pid)], { stdio: "ignore", windowsHide: true });
     else process.kill(ctl.pid, "SIGKILL");
     await sleep(2000);
 

@@ -93,7 +93,7 @@ const args = [
 
 console.log(`[fancy-pty] rustc --target ${triple}`);
 try {
-    execFileSync("rustc", args, { stdio: "inherit", cwd: root });
+    execFileSync("rustc", args, { stdio: "inherit", cwd: root, windowsHide: true });
 } catch (e) {
     console.error(
         `\n[fancy-pty] rustc failed. For a cross build, run:\n` +
@@ -113,5 +113,5 @@ console.log(`[fancy-pty] ${path.relative(root, exe)}  ${statSync(exe).size} byte
 // A cross build is skipped rather than pretended: running it under emulation
 // would report on the emulator.
 if (key === `${process.platform}-${process.arch}`) {
-    execFileSync(exe, ["--selftest"], { stdio: "inherit" });
+    execFileSync(exe, ["--selftest"], { stdio: "inherit", windowsHide: true });
 }

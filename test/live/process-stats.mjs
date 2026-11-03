@@ -79,7 +79,7 @@ export function processStats(pid = process.pid) {
                     "-Command",
                     `$p = Get-Process -Id ${pid}; "$($p.Threads.Count) $($p.HandleCount)"`,
                 ],
-                { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+                { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
             ).trim();
             const [threads, handles] = out.split(/\s+/).map(Number);
             return {

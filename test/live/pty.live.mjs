@@ -471,7 +471,7 @@ console.log("\n8. nothing survives the run");
             const out = execFileSync(
                 "tasklist",
                 ["/FI", "IMAGENAME eq fancy-pty-helper.exe", "/NH"],
-                { encoding: "utf8" },
+                { encoding: "utf8", windowsHide: true },
             );
             alive = out.split("\n").filter((l) => /fancy-pty-helper\.exe/i.test(l)).length;
         } else {

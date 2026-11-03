@@ -32,7 +32,7 @@ const TARGETS = [
     "aarch64-apple-darwin",
 ];
 
-const installed = execFileSync("rustup", ["target", "list", "--installed"], { encoding: "utf8" })
+const installed = execFileSync("rustup", ["target", "list", "--installed"], { encoding: "utf8", windowsHide: true })
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -61,7 +61,7 @@ for (const target of TARGETS) {
                 path.join(out, `${target}.rmeta`),
                 path.join(root, "native", "helper.rs"),
             ],
-            { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+            { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
         );
         // Warnings go to stderr and execFileSync returns stdout, so re-run the
         // judgement on what rustc actually said rather than on the exit code:
