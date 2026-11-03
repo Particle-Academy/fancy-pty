@@ -100,6 +100,71 @@ describe("SPAWN encoding", () => {
     });
 });
 
+describe("SPAWN flags (windowsVerbatimArguments)", () => {
+    const req = { argv: ["cmd.exe", "/c", 'echo "hi"'], cwd: "C:\\tmp", env: { A: "1" }, cols: 80, rows: 24 };
+
+    /**
+     * The 0.2.1 encoding, spelled out byte by byte rather than produced by the
+     * encoder under test. A default spawn must stay exactly this, or a new JS
+     * side stops being able to drive an older helper for a reason that has
+     * nothing to do with the option.
+     */
+    const str = (s: string) => {
+        const body = Buffer.from(s, "utf8");
+        const n = Buffer.alloc(4);
+        n.writeUInt32LE(body.length, 0);
+        return Buffer.concat([n, body]);
+    };
+    const count = (v: number) => {
+        const n = Buffer.alloc(4);
+        n.writeUInt32LE(v, 0);
+        return n;
+    };
+    const golden = Buffer.concat([
+        Buffer.from([80, 0, 24, 0]),
+        str("C:\\tmp"),
+        count(3),
+        str("cmd.exe"),
+        str("/c"),
+        str('echo "hi"'),
+        count(1),
+        str("A"),
+        str("1"),
+    ]);
+
+    it("leaves a default spawn byte-identical to 0.2.1", () => {
+        expect(encodeSpawn(req).equals(golden)).toBe(true);
+    });
+
+    it("treats an explicit false as the default, not as a flag", () => {
+        expect(encodeSpawn({ ...req, windowsVerbatimArguments: false }).equals(golden)).toBe(true);
+    });
+
+    it("appends exactly one u32 of flags, bit 0, and carries argv as a list unchanged", () => {
+        const buf = encodeSpawn({ ...req, windowsVerbatimArguments: true });
+        expect(buf.length).toBe(golden.length + 4);
+        // Everything before the trailer is the default encoding: no element is
+        // pre-joined or pre-quoted on this side.
+        expect(buf.subarray(0, golden.length).equals(golden)).toBe(true);
+        expect(buf.readUInt32LE(golden.length)).toBe(1);
+    });
+
+    it("refuses a non-boolean, as Node does, instead of guessing", () => {
+        // "false" is truthy and 0 is falsy. Either guess, in either direction,
+        // means a line quoted or not quoted against what the caller meant.
+        for (const bad of ["true", "false", 1, 0, {}]) {
+            expect(() =>
+                encodeSpawn({ ...req, windowsVerbatimArguments: bad as unknown as boolean }),
+            ).toThrow(/windowsVerbatimArguments must be a boolean/);
+        }
+    });
+
+    it("treats null like absent, as Node does", () => {
+        const none = encodeSpawn({ ...req, windowsVerbatimArguments: null as unknown as boolean });
+        expect(none.equals(golden)).toBe(true);
+    });
+});
+
 describe("dimensions", () => {
     it("clamps rather than throwing", () => {
         // A transient 0 arrives from layout code during mount. Refusing to open

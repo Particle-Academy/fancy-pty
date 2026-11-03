@@ -26,6 +26,47 @@ no way to report:
 | `onData(cb)` · `onExit(cb)` | its output and its end |
 | `onError(cb)` | spawn failures, protocol faults, a helper that died |
 
+## Running a shell line on Windows
+
+`argv` is a list, and by default the helper quotes it into a command line by the
+rules ordinary Windows programs parse. `cmd.exe` is not one of them. It does not
+read `\"` as a quote, so a quoted path in a line passed to `cmd.exe /c` fails
+with `'\"C:\...\node.exe\"' is not recognized`.
+
+`windowsVerbatimArguments: true` is Node's `child_process` option of the same
+name. It joins `argv` with single spaces and changes nothing else:
+
+```ts
+// The line carries an outer pair of quotes, exactly as Node's `shell: true` does.
+const line = `"C:\\Program Files\\nodejs\\node.exe" --version`;
+open({ argv: ["cmd.exe", "/d", "/s", "/c", `"${line}"`], windowsVerbatimArguments: true, env: process.env });
+```
+
+> **Warning: never pass untrusted text through this option. It is command
+> injection.** All quoting becomes your job, and in a line given to `cmd.exe`,
+> `&`, `|`, `<`, `>`, `^` and `%VAR%` are live. A filename, a branch name or any
+> other value you did not write can run commands of its own. Quoting does not
+> make it safe: the value can contain a `"` that closes your quotes. If you have
+> a program and a list of arguments, use the default mode, which needs no quoting
+> from you and starts no shell.
+
+- **Outer quotes matter, and leaving them off can run the wrong program.** `/s`
+  makes `cmd.exe` remove the first and the last `"` on the line, so
+  `"C:\a b\x.exe" --flag` becomes `C:\a b\x.exe --flag`, and `cmd.exe` then looks
+  for a program called `C:\a`. If `C:\a.exe` exists, that is what runs. Wrap the
+  whole line in one more pair, as above, every time.
+- **`argv[0]` is still the program, not part of the line.** Pass it unquoted. It
+  is quoted for you if it has whitespace, so `C:\Program Files\x.exe` cannot run
+  `C:\Program.exe`. A `"` in it is refused with an error. This is the one
+  difference from Node, which sends it raw and resolves the program separately;
+  without whitespace the two command lines are byte-identical.
+- **Program lookup and errors are unchanged.** A program that cannot be found is
+  an `onError` naming it, as in a default spawn.
+- **On Linux and macOS the option is ignored**, as in Node: `argv` goes straight
+  to `execvp` and there is no command line. A non-boolean value throws on every
+  platform.
+- **Default off.** A spawn without it is byte-for-byte what it always was.
+
 ## Why this exists
 
 **It replaces `node-pty`, and it was not a preference.**

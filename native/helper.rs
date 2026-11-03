@@ -228,12 +228,18 @@ fn kill_grace_ms(payload: &[u8]) -> u32 {
 
 // ------------------------------------------------------------- spawn decoding
 
+/// SPAWN's flags. Pass the command line through as written; Windows only, and
+/// read by nothing on POSIX, where argv goes straight to execvp.
+const SPAWN_FLAG_WINDOWS_VERBATIM: u32 = 1;
+const SPAWN_FLAGS_KNOWN: u32 = SPAWN_FLAG_WINDOWS_VERBATIM;
+
 struct SpawnRequest {
     cols: u16,
     rows: u16,
     cwd: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    windows_verbatim: bool,
 }
 
 struct Cursor<'a> {
@@ -297,6 +303,16 @@ fn decode_spawn(payload: &[u8]) -> Result<SpawnRequest, String> {
     if argv.is_empty() {
         return Err("SPAWN carried no argv".into());
     }
+    // Optional `[flags: u32 LE]`, absent from a default spawn. An unknown bit is
+    // refused: ignoring `windowsVerbatimArguments`, say, would quote the line
+    // and reproduce the bug it exists to avoid, with nothing to explain why.
+    let flags = if c.at == payload.len() { 0 } else { c.u32()? };
+    if flags & !SPAWN_FLAGS_KNOWN != 0 {
+        return Err(format!(
+            "SPAWN carries unknown flags 0x{:x} -- version skew between the JS side and the helper",
+            flags & !SPAWN_FLAGS_KNOWN
+        ));
+    }
     if c.at != payload.len() {
         return Err(format!(
             "SPAWN has {} trailing bytes -- version skew between the JS side and the helper",
@@ -309,6 +325,7 @@ fn decode_spawn(payload: &[u8]) -> Result<SpawnRequest, String> {
         cwd,
         argv,
         env,
+        windows_verbatim: flags & SPAWN_FLAG_WINDOWS_VERBATIM != 0,
     })
 }
 
@@ -371,6 +388,43 @@ fn windows_command_line(argv: &[String]) -> String {
         out.push('"');
     }
     out
+}
+
+/// The string handed to `CreateProcessW`: the CRT join above by default, or,
+/// with `windowsVerbatimArguments`, the elements joined with single spaces and
+/// otherwise untouched.
+///
+/// ELEMENT 0 STAYS A PROGRAM NAME in both modes, and that is the one place this
+/// differs from Node. libuv resolves the program itself and passes it as
+/// `lpApplicationName`, so its raw element 0 can never pick the wrong image.
+/// This helper passes NULL there, and `CreateProcessW` then parses the program
+/// out of the line: an unquoted `C:\Program Files\x.exe` tries `C:\Program.exe`
+/// first. So element 0 keeps its CRT quoting, which is a no-op for a path with
+/// no whitespace (byte-identical to Node) and also gives the child an argv that
+/// lines up, where Node's raw `dir with space\x.exe` parses as three elements.
+/// Resolution is the same code path as a default spawn, not a second one.
+///
+/// A `"` cannot be in a Windows filename, so one in element 0 means the caller
+/// put a line there. That is refused rather than quoted into a not-found error.
+fn command_line(argv: &[String], verbatim: bool) -> Result<String, String> {
+    if !verbatim {
+        return Ok(windows_command_line(argv));
+    }
+    if argv.iter().any(|a| a.contains('\0')) {
+        return Err("windowsVerbatimArguments: an argument contains a NUL, which would cut the command line short".into());
+    }
+    let program = &argv[0];
+    if program.contains('"') {
+        return Err(format!(
+            "windowsVerbatimArguments: element 0 is the program, not a command line, and is quoted for you: remove the quotes from {program:?} and pass its arguments as further elements"
+        ));
+    }
+    let mut out = windows_command_line(std::slice::from_ref(program));
+    for arg in &argv[1..] {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    Ok(out)
 }
 
 fn main() {
@@ -530,6 +584,110 @@ fn selftest() {
     expect(
         kill_grace_ms(&10_000u32.to_le_bytes()) == 10_000,
         "a 4-byte KILL carries graceMs",
+    );
+
+    // SPAWN flags: the optional u32 after env.
+    let spawn_payload = |trailer: &[u8]| -> Vec<u8> {
+        let mut p: Vec<u8> = Vec::new();
+        p.extend(80u16.to_le_bytes());
+        p.extend(24u16.to_le_bytes());
+        p.extend(0u32.to_le_bytes()); // cwd ""
+        p.extend(1u32.to_le_bytes()); // argc 1
+        p.extend(3u32.to_le_bytes());
+        p.extend(b"cmd");
+        p.extend(0u32.to_le_bytes()); // envc 0
+        p.extend(trailer);
+        p
+    };
+    expect(
+        matches!(decode_spawn(&spawn_payload(&[])), Ok(r) if !r.windows_verbatim),
+        "a SPAWN with no flags (the 0.2.1 encoding) is not verbatim",
+    );
+    expect(
+        matches!(decode_spawn(&spawn_payload(&0u32.to_le_bytes())), Ok(r) if !r.windows_verbatim),
+        "flags 0 is not verbatim",
+    );
+    expect(
+        matches!(decode_spawn(&spawn_payload(&1u32.to_le_bytes())), Ok(r) if r.windows_verbatim),
+        "flags bit 0 is verbatim",
+    );
+    // Silently ignoring a flag from a newer JS side would quote the line and
+    // reproduce the very bug the flag exists to avoid, with no explanation.
+    expect(
+        matches!(decode_spawn(&spawn_payload(&2u32.to_le_bytes())), Err(e) if e.contains("unknown flags")),
+        "an unknown flag is refused, not ignored",
+    );
+    expect(
+        matches!(decode_spawn(&spawn_payload(&3u32.to_le_bytes())), Err(e) if e.contains("unknown flags")),
+        "an unknown flag beside a known one is refused too",
+    );
+    expect(
+        decode_spawn(&spawn_payload(&[1, 0])).is_err(),
+        "a truncated flags field is refused",
+    );
+    expect(
+        matches!(decode_spawn(&spawn_payload(&[1, 0, 0, 0, 9])), Err(e) if e.contains("trailing")),
+        "bytes after the flags are still version skew",
+    );
+
+    // Verbatim join. Spelled with raw strings: these are the characters.
+    let list = |a: &[&str]| -> Vec<String> { a.iter().map(|s| s.to_string()).collect() };
+    let verbatim = |a: &[&str]| command_line(&list(a), true);
+    let same = |a: &[&str], want: &str| verbatim(a).as_deref() == Ok(want);
+    expect(
+        same(
+            &["cmd.exe", "/d", "/s", "/c", r#""C:\plain\node.exe" --version"#],
+            r#"cmd.exe /d /s /c "C:\plain\node.exe" --version"#,
+        ),
+        "verbatim: Genie's line keeps its quotes, with no backslash added",
+    );
+    expect(
+        same(&["x.exe", r"C:\dir\", r#"a\"b"#], r#"x.exe C:\dir\ a\"b"#),
+        "verbatim: backslashes are not doubled anywhere",
+    );
+    expect(
+        same(&["x.exe", "", "a  b", "c"], "x.exe  a  b c"),
+        "verbatim: single-space join, an empty element adds nothing but its space",
+    );
+    expect(
+        same(&["x.exe", "a&b|c^d"], "x.exe a&b|c^d"),
+        "verbatim: cmd metacharacters are the caller's",
+    );
+    expect(same(&["x.exe"], "x.exe"), "verbatim: a bare program");
+    // Element 0 alone stays a program name: with no lpApplicationName,
+    // CreateProcessW would try C:\Program.exe for an unquoted one.
+    expect(
+        same(
+            &[r"C:\Program Files\x.exe", r#""a b""#],
+            r#""C:\Program Files\x.exe" "a b""#,
+        ),
+        "verbatim: a program with a space is quoted, its arguments are not",
+    );
+    expect(
+        matches!(verbatim(&[r#""C:\x.exe" --flag"#, "a"]), Err(e) if e.contains("element 0 is the program")),
+        "verbatim: a quote in element 0 is refused (it cannot be in a filename)",
+    );
+    expect(
+        matches!(verbatim(&["x.exe", "a\0 b"]), Err(e) if e.contains("NUL")),
+        "verbatim: a NUL is refused, it would silently cut the line short",
+    );
+
+    // Default mode goes through the join above, byte for byte.
+    let unchanged = |a: &[&str], want: &str| command_line(&list(a), false).as_deref() == Ok(want);
+    expect(unchanged(&["powershell", "-NoLogo"], "powershell -NoLogo"), "default: bare stays bare");
+    expect(
+        unchanged(
+            &["cmd.exe", "/d", "/s", "/c", r#""C:\plain\node.exe" --version"#],
+            r#"cmd.exe /d /s /c "\"C:\plain\node.exe\" --version""#,
+        ),
+        "default: an embedded quote is still backslash-escaped (the measured 0.2.1 line)",
+    );
+    expect(
+        unchanged(
+            &[r"C:\Program Files\x.exe", r"C:\Program Files\", "next", ""],
+            r#""C:\Program Files\x.exe" "C:\Program Files\\" next """#,
+        ),
+        "default: spaces, a trailing backslash and an empty argument are unchanged",
     );
 
     // Lifetime: the state machine the three threads share.
@@ -871,6 +1029,8 @@ mod win {
     unsafe impl Sync for SendHandle {}
 
     pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<u32, String> {
+        // First, so a refused request has created nothing.
+        let command = command_line(&req.argv, req.windows_verbatim)?;
         unsafe {
             // RE-ENABLE Ctrl-C before creating the command, or F4's graceful
             // kill cannot work. The JS side spawns this helper detached, and
@@ -959,7 +1119,7 @@ mod win {
                 lp_attribute_list: list,
             };
 
-            let mut cmdline = wide(&windows_command_line(&req.argv));
+            let mut cmdline = wide(&command);
             let cwd = if req.cwd.is_empty() {
                 None
             } else {

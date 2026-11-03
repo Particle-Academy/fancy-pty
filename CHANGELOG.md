@@ -8,6 +8,32 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+### Added
+
+- **`windowsVerbatimArguments` on `open()`, for running a shell line on Windows**
+  (genie#1428, genie#1431). Node's `child_process` option of the same name: `argv`
+  is joined with single spaces and not otherwise quoted, because `cmd.exe` does
+  not read the `\"` the default quoting produces. Before this, any line with a
+  quoted path failed through `cmd.exe /c`, even with no spaces in the path:
+  `'\"C:\...\node.exe\"' is not recognized`.
+
+  **All quoting becomes the caller's, so passing untrusted text through it is
+  command injection.** See the README.
+
+  It differs from Node in one place. `argv[0]` stays the program and is quoted if
+  it has whitespace, so `C:\Program Files\x.exe` cannot run `C:\Program.exe`; a
+  `"` in it, or a NUL in any element, is refused. Without whitespace in `argv[0]`
+  the command line is byte-identical to Node's. Through `cmd.exe /s`, wrap the
+  line in an outer pair of quotes, as Node's `shell: true` does. Ignored on Linux
+  and macOS, as in Node. A non-boolean value throws on every platform.
+
+  The SPAWN frame gained an optional trailing `flags` field, sent only when a flag
+  is set. A helper refuses a flag it does not know, rather than ignoring it.
+
+  **What you must DO:** nothing, unless you want the option. The default is off,
+  and a spawn without it sends the same bytes and produces the same command line
+  as before.
+
 ## [0.2.1] - 2026-11-02
 
 ### Fixed

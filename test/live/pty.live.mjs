@@ -301,6 +301,276 @@ if (isWindows) {
     ok(vs.text().includes("BATCH-RAN"), "and running it through cmd.exe /c works");
 }
 
+// ------------------------------- 6d. windowsVerbatimArguments, Windows half
+if (isWindows) {
+    console.log("\n6d. windowsVerbatimArguments: the line reaches the child as written (genie#1428, #1431)");
+
+    // Every assertion reads what the child REPORTED (fixtures/cmdline-echo.rs:
+    // GetCommandLineW and its parsed argv, as numbers, to a file), never pty
+    // text. Pty text is used only for cmd.exe's own error messages.
+    const { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } =
+        await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const pathMod = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const { spawnSync } = await import("node:child_process");
+
+    const root = realpathSync.native(mkdtempSync(pathMod.join(tmpdir(), "fancy-pty-verbatim-")));
+    try {
+        const source = fileURLToPath(new URL("./fixtures/cmdline-echo.rs", import.meta.url));
+        const noSpaces = pathMod.join(root, "bare");
+        const spaced = pathMod.join(root, "dir with space");
+        mkdirSync(noSpaces);
+        mkdirSync(spaced);
+        const echo = pathMod.join(noSpaces, "echo.exe");
+        execFileSync(
+            "rustc",
+            ["-C", "target-feature=+crt-static", "-C", "debuginfo=0", source, "-o", echo],
+            { stdio: "pipe", windowsHide: true },
+        );
+        const spacedEcho = pathMod.join(spaced, "echo.exe");
+        copyFileSync(echo, spacedEcho);
+        // THE PLANT. CreateProcessW given no application name and an unquoted
+        // `...\dir with space\echo.exe` tries `...\dir.exe` FIRST.
+        const plant = pathMod.join(root, "dir.exe");
+        copyFileSync(echo, plant);
+
+        ok(!/\s/.test(echo), `precondition: the no-spaces path really has none (${echo})`);
+
+        const units = (a) => String.fromCharCode(...a);
+        const decode = (r) => ({ exe: units(r.exe), raw: units(r.raw), argv: r.argv.map(units) });
+        let runs = 0;
+        const report = (out) =>
+            existsSync(out)
+                ? readFileSync(out, "utf8")
+                      .split("\n")
+                      .filter(Boolean)
+                      .map((l) => decode(JSON.parse(l)))
+                : [];
+        const run = async (options) => {
+            const out = pathMod.join(root, `out-${runs++}.jsonl`);
+            const pty = open({
+                cols: 400,
+                rows: 30,
+                env: { ...process.env, FANCY_PTY_ECHO_OUT: out },
+                ...options,
+            });
+            const c = collect(pty);
+            const code = await withTimeout(c.exit, 15000);
+            if (code === "TIMEOUT") pty.kill();
+            return {
+                code,
+                records: report(out),
+                text: c.text().replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07/g, ""),
+                errors: c.errors.map((e) => e.message),
+            };
+        };
+        const viaCmd = (line, verbatim = true) =>
+            run({
+                argv: ["cmd.exe", "/d", "/s", "/c", line],
+                ...(verbatim ? { windowsVerbatimArguments: true } : {}),
+            });
+        const argvOf = (r) => JSON.stringify(r.records[0]?.argv.slice(1));
+        const q = '"';
+        const codepoints = (s, n = 24) =>
+            [...s.slice(0, n)].map((ch) => ch.codePointAt(0).toString(16)).join(" ");
+
+        // What cmd.exe would be handed. The fixture stands in for cmd.exe with
+        // the same arguments, so the difference is read off the command line
+        // itself, as code points, rather than inferred from cmd's complaint.
+        console.log("     -- the bytes, with the fixture standing in for cmd.exe");
+        const lineGenie = `${q}${echo}${q} --version`;
+        const quotedDefault = await run({ argv: [echo, "/d", "/s", "/c", lineGenie] });
+        const quotedVerbatim = await run({
+            argv: [echo, "/d", "/s", "/c", lineGenie],
+            windowsVerbatimArguments: true,
+        });
+        const prefix = `${echo} /d /s /c `.length;
+        const tailDefault = (quotedDefault.records[0]?.raw ?? "").slice(prefix);
+        const tailVerbatim = (quotedVerbatim.records[0]?.raw ?? "").slice(prefix);
+        console.log(`     default : ${quotedDefault.records[0]?.raw}`);
+        console.log(`               starts ${codepoints(tailDefault, 4)}`);
+        console.log(`     verbatim: ${quotedVerbatim.records[0]?.raw}`);
+        console.log(`               starts ${codepoints(tailVerbatim, 4)}`);
+        ok(tailDefault.startsWith(`${q}\\${q}`), "control: by default the line's quote is sent as a backslash-quote");
+        ok(
+            quotedVerbatim.records[0]?.raw === `${echo} /d /s /c ${lineGenie}`,
+            "verbatim: the command line is the elements joined with single spaces, unaltered",
+        );
+
+        console.log("     -- through a real cmd.exe /d /s /c");
+        // The positive control, and Genie's measured failure. Without this the
+        // checks below could pass on a cmd.exe that was never going to object.
+        const noOption = await viaCmd(lineGenie, false);
+        ok(noOption.records.length === 0, "control: WITHOUT the option the program does not run");
+        ok(
+            noOption.text.includes(`\\${q}`) && /not recognized/.test(noOption.text),
+            `control: and cmd.exe reports the backslash-quote (${noOption.text.trim().slice(0, 100)})`,
+        );
+
+        // Genie's failing case: a quoted path with no spaces, the line as written.
+        const genie = await viaCmd(lineGenie);
+        ok(genie.records.length === 1, `a quoted path with no spaces runs (${genie.text.trim().slice(0, 100)})`);
+        ok(argvOf(genie) === JSON.stringify(["--version"]), `and its argument arrived (${argvOf(genie)})`);
+        ok(genie.code === 0 && genie.errors.length === 0, `and it exited 0 with no error (${genie.code})`);
+
+        // Outer quotes: cmd's /s removes the first and the last quote on the
+        // line. That is why Node wraps the line, and consumers must too.
+        const wrap = (line) => `${q}${line}${q}`;
+        const pathWithSpaces = await viaCmd(wrap(`${q}${spacedEcho}${q} --flag`));
+        ok(pathWithSpaces.records.length === 1, `a quoted program path with spaces runs (${pathWithSpaces.text.trim().slice(0, 100)})`);
+        ok(
+            pathWithSpaces.records[0]?.exe.toLowerCase() === spacedEcho.toLowerCase(),
+            `and it is the right image (${pathWithSpaces.records[0]?.exe})`,
+        );
+        ok(argvOf(pathWithSpaces) === JSON.stringify(["--flag"]), `with its argument (${argvOf(pathWithSpaces)})`);
+
+        // Why the README insists on the outer pair. /s strips the only quotes
+        // the line has, and cmd.exe then reads `...\dir` as the program, which
+        // PATHEXT resolves to the plant. Not a failure: the WRONG PROGRAM runs.
+        const unwrapped = await viaCmd(`${q}${spacedEcho}${q} --flag`);
+        ok(
+            unwrapped.records.length === 1 && unwrapped.records[0].exe.toLowerCase() === plant.toLowerCase(),
+            `control: the same line WITHOUT the outer quotes runs the plant (${unwrapped.records[0]?.exe})`,
+        );
+
+        const quotedArg = await viaCmd(wrap(`${q}${echo}${q} ${q}two words${q} tail`));
+        ok(argvOf(quotedArg) === JSON.stringify(["two words", "tail"]), `a quoted argument arrives whole (${argvOf(quotedArg)})`);
+
+        const metachars = await viaCmd(wrap(`${q}${echo}${q} ${q}a&b|c${q}`));
+        ok(metachars.records.length === 1, "& and | inside quotes start no second command");
+        ok(argvOf(metachars) === JSON.stringify(["a&b|c"]), `and reach the child literally (${argvOf(metachars)})`);
+
+        const operator = await viaCmd(wrap(`${q}${echo}${q} one & ${q}${echo}${q} two`));
+        ok(
+            operator.records.length === 2,
+            `control: & OUTSIDE quotes IS an operator, so the option hands the line to cmd unprotected (${operator.records.length} ran)`,
+        );
+
+        console.log("     -- the same contract as child_process");
+        const parityArgs = ["a", `${q}b c${q}`, "d\\", `e\\${q}f`];
+        const pty = await run({ argv: [echo, ...parityArgs], windowsVerbatimArguments: true });
+        const nodeOut = pathMod.join(root, "node.jsonl");
+        const nodeRun = (file, args) =>
+            spawnSync(file, args, {
+                windowsVerbatimArguments: true,
+                windowsHide: true,
+                env: { ...process.env, FANCY_PTY_ECHO_OUT: nodeOut },
+            });
+        nodeRun(echo, parityArgs);
+        const nodeRecord = report(nodeOut)[0];
+        console.log(`     node: ${nodeRecord?.raw}`);
+        console.log(`     pty : ${pty.records[0]?.raw}`);
+        ok(
+            pty.records[0]?.raw !== undefined && pty.records[0]?.raw === nodeRecord?.raw,
+            "the command line is byte-identical to Node's windowsVerbatimArguments",
+        );
+
+        console.log("     -- what runs, and what fails");
+        const plantSelf = await run({ argv: [plant] });
+        ok(
+            plantSelf.records[0]?.exe.toLowerCase() === plant.toLowerCase(),
+            "control: the plant is a working program that identifies itself",
+        );
+
+        // CreateProcessW is called with lpApplicationName NULL, so it parses the
+        // program out of the line. Element 0 alone keeps its quoting.
+        const trap = await run({ argv: [spacedEcho, "--flag"], windowsVerbatimArguments: true });
+        ok(
+            trap.records.length === 1 && trap.records[0].exe.toLowerCase() === spacedEcho.toLowerCase(),
+            `an unquoted-by-the-caller program with spaces runs ITSELF, not the plant (${trap.records[0]?.exe})`,
+        );
+        ok(
+            trap.records[0]?.raw === `${q}${spacedEcho}${q} --flag`,
+            `element 0 alone was quoted (${trap.records[0]?.raw})`,
+        );
+        ok(argvOf(trap) === JSON.stringify(["--flag"]), `so the child's own argv lines up (${argvOf(trap)})`);
+
+        // Not asserted, because it is Node's behaviour rather than ours; printed
+        // so the one place this deliberately differs stays visible.
+        rmSync(nodeOut, { force: true });
+        nodeRun(spacedEcho, ["--flag"]);
+        const nodeSpaced = report(nodeOut)[0];
+        console.log(`     note: Node here sends ${nodeSpaced?.raw}`);
+        console.log(`           and its child parses argv ${JSON.stringify(nodeSpaced?.argv)}`);
+
+        const line = `${q}${echo}${q} --version`;
+        const whole = await run({ argv: [line], windowsVerbatimArguments: true });
+        ok(whole.records.length === 0, "a whole line in element 0 is not parsed for a program");
+        ok(
+            whole.errors.some((m) => /element 0 is the program/.test(m)),
+            `and the refusal says why (${whole.errors.join("; ").slice(0, 140)})`,
+        );
+        ok(whole.code === 1, `and the pty still reports EXIT 1 (${whole.code})`);
+
+        const missing = await run({
+            argv: ["this-program-does-not-exist-xyz", "/c", `${q}x${q}`],
+            windowsVerbatimArguments: true,
+        });
+        ok(missing.code === 1, `a failed verbatim start reports EXIT 1 (${missing.code})`);
+        ok(
+            missing.errors.some(
+                (m) => m.includes("this-program-does-not-exist-xyz") && /appends \.exe and NOTHING else/.test(m),
+            ),
+            `and the usual error, naming the program and the rule (${missing.errors.join("; ").slice(0, 110)})`,
+        );
+
+        const missingExt = await run({
+            argv: ["this-program-does-not-exist-xyz.exe", `${q}x${q}`],
+            windowsVerbatimArguments: true,
+        });
+        ok(
+            missingExt.errors.some((m) => /not found on PATH/.test(m)),
+            `and with an extension, the plain not-found hint (${missingExt.errors.join("; ").slice(0, 110)})`,
+        );
+
+        const bareCmd = await run({
+            argv: ["cmd", "/d", "/s", "/c", lineGenie],
+            windowsVerbatimArguments: true,
+        });
+        ok(bareCmd.records.length === 1, "a bare `cmd` still resolves in verbatim mode");
+
+        console.log("     -- default off: nothing else moved");
+        const hand = `${echo} ${q}a b${q} ${q}q\\${q}r${q} C:\\d\\ ${q}${q}`;
+        const argsForDefault = ["a b", `q${q}r`, "C:\\d\\", ""];
+        const unset = await run({ argv: [echo, ...argsForDefault] });
+        const off = await run({ argv: [echo, ...argsForDefault], windowsVerbatimArguments: false });
+        ok(unset.records[0]?.raw === hand, `an ordinary spawn's command line is unchanged (${unset.records[0]?.raw})`);
+        ok(off.records[0]?.raw === hand, "and `false` is the same line");
+        ok(
+            JSON.stringify(unset.records[0]?.argv.slice(1)) === JSON.stringify(argsForDefault),
+            "and the child parses back exactly the list it was given",
+        );
+        const spacedDefault = await run({ argv: [spacedEcho, "x"] });
+        ok(
+            spacedDefault.records[0]?.raw === `${q}${spacedEcho}${q} x` &&
+                spacedDefault.records[0]?.exe.toLowerCase() === spacedEcho.toLowerCase(),
+            "and a default spawn of a spaced program still runs that program",
+        );
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+}
+
+// ------------------------------- 6e. windowsVerbatimArguments, POSIX half
+if (!isWindows) {
+    console.log("\n6e. windowsVerbatimArguments is IGNORED on POSIX, as in Node");
+    // argv goes straight to execvp, so there is no command line for the option
+    // to affect. The same request with and without it must behave identically.
+    const argv = ["/bin/sh", "-c", 'printf "[%s]" "$1"; echo', "sh", 'a "b" c'];
+    const go = async (options) => {
+        const pty = open({ argv, env: process.env, ...options });
+        const c = collect(pty);
+        const code = await withTimeout(c.exit, 15000);
+        return { code, text: c.text(), errors: c.errors };
+    };
+    const plain = await go({});
+    const flagged = await go({ windowsVerbatimArguments: true });
+    ok(plain.text.includes('[a "b" c]'), `control: the argument arrives whole without it (${JSON.stringify(plain.text)})`);
+    ok(flagged.text === plain.text, `and identically with it (${JSON.stringify(flagged.text)})`);
+    ok(flagged.code === 0 && flagged.errors.length === 0, `with exit 0 and no error (${flagged.code})`);
+}
+
 // --------------------------------------------------------- 7. THE BAR
 console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
 {

@@ -139,6 +139,17 @@ counts them alive first.
 machine, so on a desktop running Genie (which ships this package) it reports
 Genie's helpers as survivors. Read it on a clean runner, or by path.
 
+### `windowsVerbatimArguments` and element 0
+
+`lpApplicationName` is NULL, so `CreateProcessW` parses the program out of the
+command line. Verbatim mode therefore joins everything raw EXCEPT element 0, which
+keeps the ordinary quoting. Do not make it raw to match Node byte for byte: Node
+can, because libuv resolves the program and passes it as `lpApplicationName`, and
+here it would run `C:\dir.exe` for `C:\dir with space\x.exe`. Check `6d` plants
+that `dir.exe`. It reads what the child reported through
+`fixtures/cmdline-echo.rs` (`GetCommandLineW`, as numbers, to a file), because
+pty text is re-rendered by ConPTY and a Node child shows only the parsed argv.
+
 ## Testing
 
 ```

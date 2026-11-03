@@ -90,7 +90,22 @@ export interface SpawnRequest {
     env?: Record<string, string | undefined>;
     cols?: number;
     rows?: number;
+    /**
+     * WINDOWS: pass the arguments to the command line exactly as written,
+     * joined with single spaces — Node's `child_process` option of the same
+     * name. For running a shell line, where `cmd.exe` cannot read the `\"` that
+     * the default quoting produces. Ignored on POSIX, as in Node. Default `false`.
+     *
+     * **All quoting becomes the caller's, so untrusted text in `argv` is command
+     * injection.** `argv[0]` stays the program name and is quoted for you if it
+     * has whitespace, so it cannot resolve to the wrong program (unlike Node's,
+     * it is not sent raw); a `"` in it is refused. See the README.
+     */
+    windowsVerbatimArguments?: boolean;
 }
+
+/** SPAWN's `[flags: u32 LE]` trailer. See `native/proto.md`. */
+const SPAWN_FLAG_WINDOWS_VERBATIM = 1;
 
 function u32(value: number): Buffer {
     const b = Buffer.allocUnsafe(4);
@@ -103,10 +118,18 @@ function lengthPrefixed(s: string): Buffer {
     return Buffer.concat([u32(body.length), body]);
 }
 
-/** `[cols u16][rows u16][cwd str][argc u32][argv…][envc u32][k,v…]` */
+/**
+ * `[cols u16][rows u16][cwd str][argc u32][argv…][envc u32][k,v…]`, then
+ * `[flags u32]` only if a flag is set: a default spawn stays byte-identical to
+ * 0.2.1, and a helper too old to know a flag rejects the trailing bytes.
+ */
 export function encodeSpawn(req: SpawnRequest): Buffer {
     if (!Array.isArray(req.argv) || req.argv.length === 0) {
         throw new TypeError("fancy-pty: argv must be a non-empty array");
+    }
+    const verbatim = req.windowsVerbatimArguments;
+    if (verbatim != null && typeof verbatim !== "boolean") {
+        throw new TypeError("fancy-pty: windowsVerbatimArguments must be a boolean");
     }
 
     const size = Buffer.allocUnsafe(4);
@@ -129,6 +152,10 @@ export function encodeSpawn(req: SpawnRequest): Buffer {
     parts.push(u32(entries.length));
     for (const [k, v] of entries) {
         parts.push(lengthPrefixed(k), lengthPrefixed(v));
+    }
+
+    if (verbatim === true) {
+        parts.push(u32(SPAWN_FLAG_WINDOWS_VERBATIM));
     }
 
     return Buffer.concat(parts);
