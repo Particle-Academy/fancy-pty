@@ -26,6 +26,32 @@ no way to report:
 | `onData(cb)` · `onExit(cb)` | its output and its end |
 | `onError(cb)` | spawn failures, protocol faults, a helper that died |
 
+## Which program a name starts on Windows
+
+A name with no directory part, like `cmd.exe` above, is looked up in this order,
+with `.exe` appended if it has no extension:
+
+1. the system directory
+2. the Windows directory
+3. the absolute entries of `PATH`, as seen by the process that called `open()`
+
+**The current directory, the directory the helper lives in, relative or empty
+`PATH` entries and the `cwd` option are not searched.** So a bare `cmd.exe` means
+the system's, whatever folder your app happens to be running in.
+
+- **A program in the current directory has to be asked for:** `.\tool.exe`, or an
+  absolute path. A name with a directory part is relative to the process that
+  called `open()`, not to the `cwd` option, and is not searched.
+- **A `.cmd` or `.bat` needs its extension:** `npm.cmd`, not `npm`. It is resolved
+  the same way, and the script sees its full path as `%0`.
+- **`env.PATH` does not affect this.** It is what the child gets, not where the
+  program is looked for.
+- **A shell does its own lookup once it is running.** `cmd.exe` looks in its
+  current directory first, so `cmd.exe /c npm` is not covered by the above. Start
+  `npm.cmd` directly.
+
+On Linux and macOS, `argv[0]` goes to `execvp`, which uses `PATH` from `env`.
+
 ## Running a shell line on Windows
 
 `argv` is a list, and by default the helper quotes it into a command line by the
@@ -48,7 +74,8 @@ open({ argv: ["cmd.exe", "/d", "/s", "/c", `"${line}"`], windowsVerbatimArgument
 > other value you did not write can run commands of its own. Quoting does not
 > make it safe: the value can contain a `"` that closes your quotes. If you have
 > a program and a list of arguments, use the default mode, which needs no quoting
-> from you and starts no shell.
+> from you and starts no shell. The exception is a `.cmd` or `.bat`: Windows always
+> runs one through `cmd.exe`, in either mode, so pass it only values you wrote.
 
 - **Outer quotes matter, and leaving them off can run the wrong program.** `/s`
   makes `cmd.exe` remove the first and the last `"` on the line, so
@@ -60,8 +87,8 @@ open({ argv: ["cmd.exe", "/d", "/s", "/c", `"${line}"`], windowsVerbatimArgument
   `C:\Program.exe`. A `"` in it is refused with an error. This is the one
   difference from Node, which sends it raw and resolves the program separately;
   without whitespace the two command lines are byte-identical.
-- **Program lookup and errors are unchanged.** A program that cannot be found is
-  an `onError` naming it, as in a default spawn.
+- **Program lookup and errors are the same as a default spawn.** A program that
+  cannot be found is an `onError` naming it.
 - **On Linux and macOS the option is ignored**, as in Node: `argv` goes straight
   to `execvp` and there is no command line. A non-boolean value throws on every
   platform.

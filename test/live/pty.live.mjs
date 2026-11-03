@@ -249,14 +249,14 @@ if (isWindows) {
     // MEASURED, and pinned here so it cannot change silently. `claude · tynn`
     // found that node-pty's conpty path throws `File not found: ` with nothing
     // after the colon for a bare `cmd` -- a user typing `cmd` into a command
-    // box hits it. fancy-pty does NOT, because `CreateProcessW` appends `.exe`
-    // itself. But it appends ONLY `.exe`, so the rest of PATHEXT does not
-    // resolve, and that boundary is exactly what these three assertions fix in
-    // place.
+    // box hits it. fancy-pty does NOT, because the helper appends `.exe` when it
+    // resolves a name. But it appends ONLY `.exe`, so the rest of PATHEXT does
+    // not resolve, and that boundary is exactly what these three assertions fix
+    // in place. Which file a name means is lookup.live.mjs.
     const bare = open({ argv: ["cmd", "/c", "echo", "NOEXT-OK"], env: process.env });
     const b = collect(bare);
     await withTimeout(b.exit, 15000);
-    ok(b.text().includes("NOEXT-OK"), "a bare `cmd` resolves — CreateProcessW appends .exe");
+    ok(b.text().includes("NOEXT-OK"), "a bare `cmd` resolves — .exe is appended");
 
     // A .cmd file cannot be exec'd directly at all: it is not an executable
     // image. Written to a temp file rather than relying on npm's layout, so the
@@ -473,8 +473,8 @@ if (isWindows) {
             "control: the plant is a working program that identifies itself",
         );
 
-        // CreateProcessW is called with lpApplicationName NULL, so it parses the
-        // program out of the line. Element 0 alone keeps its quoting.
+        // The program is the program, whatever else is on disk. Element 0 alone
+        // keeps its quoting.
         const trap = await run({ argv: [spacedEcho, "--flag"], windowsVerbatimArguments: true });
         ok(
             trap.records.length === 1 && trap.records[0].exe.toLowerCase() === spacedEcho.toLowerCase(),

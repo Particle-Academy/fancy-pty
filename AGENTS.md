@@ -62,6 +62,7 @@ Do not "fix" it back.
 | `scripts/check-helpers.mjs` | `prepublishOnly` arch gate |
 | `test/live/pty.live.mjs` | real shells + the leak bar |
 | `test/live/lifecycle.live.mjs` | process LIFETIME: controller death, conhosts per pty, job race, graceful kill |
+| `test/live/lookup.live.mjs` | Windows: which program a name actually starts |
 
 ## The helper (`native/helper.rs`)
 
@@ -141,14 +142,47 @@ Genie's helpers as survivors. Read it on a clean runner, or by path.
 
 ### `windowsVerbatimArguments` and element 0
 
-`lpApplicationName` is NULL, so `CreateProcessW` parses the program out of the
-command line. Verbatim mode therefore joins everything raw EXCEPT element 0, which
-keeps the ordinary quoting. Do not make it raw to match Node byte for byte: Node
-can, because libuv resolves the program and passes it as `lpApplicationName`, and
-here it would run `C:\dir.exe` for `C:\dir with space\x.exe`. Check `6d` plants
-that `dir.exe`. It reads what the child reported through
-`fixtures/cmdline-echo.rs` (`GetCommandLineW`, as numbers, to a file), because
-pty text is re-rendered by ConPTY and a Node child shows only the parsed argv.
+Verbatim mode joins everything raw EXCEPT element 0, which keeps the ordinary
+quoting. Do not make it raw to match Node byte for byte: a batch file still has
+its program parsed out of the line (below), where a raw one would run
+`C:\dir.exe` for `C:\dir with space\x.cmd`, and an image's own argv would stop
+lining up. Check `6d` plants that `dir.exe`. It reads what the child reported
+through `fixtures/cmdline-echo.rs` (`GetCommandLineW`, as numbers, to a file),
+because pty text is re-rendered by ConPTY and a Node child shows only the parsed
+argv.
+
+### Program lookup on Windows
+
+**`lpApplicationName` is never NULL for an image.** Left NULL, `CreateProcessW`
+searches the helper's own directory and its current directory (inherited from the
+host) ahead of System32, so a bare `cmd.exe` could run a same-named file from
+either. `resolve_program` searches instead: system directory, Windows directory,
+absolute entries of the HELPER's PATH. A name with a directory part is relative to
+the host's cwd and is not searched. `env.PATH` from SPAWN does not drive any of
+this, and that is unchanged on purpose: whether it should is a separate decision.
+
+Three things that look like fixes and are not, all measured:
+
+- `NoDefaultCurrentDirectoryInExePath` closes the cwd case only. `SetSearchPathMode`
+  and `SetDllDirectoryW` have no effect on this search.
+- **A batch file cannot just be passed as `lpApplicationName`.** Windows runs
+  `cmd.exe /c <line>` and takes its outer quotes from having parsed the line
+  itself, so with the application name set, a quoted path plus a quoted argument
+  exits 1 and the script never starts. That is every `npm.cmd "a b"` under
+  `C:\Program Files`. So a batch file keeps NULL, which is safe because...
+- **...a bare name on a batch line is looked up a second time, by cmd.exe,** in its
+  own current directory (the `cwd` option) and then the child's PATH. Resolving
+  correctly and leaving the bare name on the line still runs a same-named script
+  from the `cwd` option. So the line carries the resolved absolute path, always
+  quoted because a PATH directory may contain `&`. This is the one case where
+  element 0 changes: the script's `%0` is the full path.
+
+`test/live/lookup.live.mjs` (`npm run verify:lookup`) drives the helper directly
+rather than through `open()`, so each case chooses the helper's environment, cwd
+and directory. **It removes `NoDefaultCurrentDirectoryInExePath` first and checks
+it did**: agent shells on the dev machine set it, and with it set the cwd case is
+green on the vulnerable code. `FANCY_PTY_LOOKUP_HELPER=<exe>` runs it against
+another build.
 
 ## Testing
 
@@ -158,6 +192,7 @@ npm run lint          # tsc --noEmit
 npm run build:helper  # rustc + the helper's --selftest
 npm run verify:pty    # LIVE: real shells, resize, kill, orphan sweep, leak bar
 npm run verify:lifecycle  # LIVE: controller death, conhosts, job race, graceful kill
+npm run verify:lookup # LIVE, Windows: which program a name actually starts
 npm run verify:flash  # LIVE, Windows: no console window ever APPEARS (#4)
 ```
 

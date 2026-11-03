@@ -50,15 +50,16 @@ does. It is still a list on the wire, so the helper still knows which element is
 the program and can name it in an error. A raw `commandLine` string could not do
 that without parsing the line for it.
 
-**Element 0 stays a program name, not part of a line.** `lpApplicationName` is
-NULL in both modes, so `CreateProcessW` parses the program from the front of the
-line, and an unquoted path with a space tries the prefix first
-(`C:\Program Files\x.exe` runs `C:\Program.exe` if it exists). So element 0 gets
+**Element 0 stays a program name, not part of a line.** The helper resolves it
+and passes the result as `lpApplicationName`, in both modes, and element 0 gets
 the ordinary join, which quotes it only if it contains whitespace. A `"` in
 element 0 and a NUL in any element are refused with `ERROR` then `EXIT`. Node
-sends its element 0 raw because libuv resolves the program itself and passes it
-as `lpApplicationName`, so the two lines match byte for byte unless the program
+sends its element 0 raw, so the two lines match byte for byte unless the program
 has whitespace.
+
+**The exception is a `.cmd` or `.bat`,** whose line is run by `cmd.exe /c`. There
+`lpApplicationName` is NULL and element 0 on the line is the resolved path, always
+quoted. See `resolve_program` and `batch_command_line` in `helper.rs`.
 
 ### Extending SPAWN
 

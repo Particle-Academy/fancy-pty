@@ -228,3 +228,9 @@ jobs:
       - name: Lifecycle suite (F1-F4)
         if: matrix.live && !cancelled()
         run: node test/live/lifecycle.live.mjs
+
+      # Which program a bare name starts on Windows. The negative claims here
+      # are proven against a plant the suite first shows running.
+      - name: Lookup suite (Windows)
+        if: matrix.live && !cancelled() && runner.os == 'Windows'
+        run: node test/live/lookup.live.mjs

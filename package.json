@@ -43,6 +43,7 @@
         "test:watch": "vitest",
         "verify:pty": "node --expose-gc test/live/pty.live.mjs",
         "verify:lifecycle": "node test/live/lifecycle.live.mjs",
+        "verify:lookup": "node test/live/lookup.live.mjs",
         "clean": "rm -rf dist bin/*/",
         "prepublishOnly": "node scripts/check-helpers.mjs && tsup",
         "lint:native": "node scripts/check-native.mjs",

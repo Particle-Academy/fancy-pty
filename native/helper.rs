@@ -395,14 +395,12 @@ fn windows_command_line(argv: &[String]) -> String {
 /// otherwise untouched.
 ///
 /// ELEMENT 0 STAYS A PROGRAM NAME in both modes, and that is the one place this
-/// differs from Node. libuv resolves the program itself and passes it as
-/// `lpApplicationName`, so its raw element 0 can never pick the wrong image.
-/// This helper passes NULL there, and `CreateProcessW` then parses the program
-/// out of the line: an unquoted `C:\Program Files\x.exe` tries `C:\Program.exe`
-/// first. So element 0 keeps its CRT quoting, which is a no-op for a path with
-/// no whitespace (byte-identical to Node) and also gives the child an argv that
-/// lines up, where Node's raw `dir with space\x.exe` parses as three elements.
-/// Resolution is the same code path as a default spawn, not a second one.
+/// differs from Node. It keeps its CRT quoting, which is a no-op for a path with
+/// no whitespace (byte-identical to Node) and gives the child an argv that lines
+/// up, where Node's raw `dir with space\x.exe` parses as three elements. It also
+/// matters for a batch file, the one case where `CreateProcessW` still parses
+/// the program out of this line: see `resolve_program`. Unquoted there,
+/// `C:\Program Files\x.cmd` would try `C:\Program.exe` first.
 ///
 /// A `"` cannot be in a Windows filename, so one in element 0 means the caller
 /// put a line there. That is refused rather than quoted into a not-found error.
@@ -425,6 +423,170 @@ fn command_line(argv: &[String], verbatim: bool) -> Result<String, String> {
         out.push_str(arg);
     }
     Ok(out)
+}
+
+// ------------------------------------------------- Windows program resolution
+
+/// What to start, once a name has been resolved.
+#[derive(Debug, PartialEq)]
+enum Program {
+    /// An image: passed as `lpApplicationName`, the command line left as it was.
+    Image(String),
+    /// A `.cmd` or `.bat`: see `batch_command_line`.
+    Batch(String),
+}
+
+fn has_directory_part(program: &str) -> bool {
+    program.contains(|c: char| c == '\\' || c == '/' || c == ':')
+}
+
+/// `C:\x`, `C:/x` and `\\server\share` name one place whatever the current
+/// directory is. `.`, an empty entry, `x\y`, `\x` and `C:x` all depend on it.
+fn is_absolute_path_entry(entry: &str) -> bool {
+    let b = entry.as_bytes();
+    let slash = |c: u8| c == b'\\' || c == b'/';
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && slash(b[2]))
+        || (b.len() >= 2 && slash(b[0]) && slash(b[1]))
+}
+
+/// `.exe` when the last component has no extension, and nothing else: that is
+/// the rule `CreateProcessW` applies when it does the search itself.
+fn with_exe(program: &str) -> String {
+    let last = program.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(program);
+    if last.contains('.') {
+        program.to_string()
+    } else {
+        format!("{program}.exe")
+    }
+}
+
+fn is_batch(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
+/// Decide which file a name means, BEFORE anything is created.
+///
+/// Why this exists: given `lpApplicationName = NULL`, `CreateProcessW` searches
+/// the helper's own directory and the helper's current directory ahead of the
+/// system directories. A same-named file in either would run in place of the
+/// real program. `NoDefaultCurrentDirectoryInExePath` closes only the second,
+/// and `SetSearchPathMode` and `SetDllDirectoryW` change neither (both measured).
+/// So the search happens here, and Windows is told the answer.
+///
+/// A name with no directory part: the system directory, the Windows directory,
+/// then ABSOLUTE entries of the helper's PATH, in order. A relative or empty
+/// entry is skipped, because it is the current directory by another route. So
+/// is a quoted one, as it was: `CreateProcessW` never unquoted them either.
+///
+/// A name with a directory part means what it says: relative to the helper's
+/// current directory, which is the host's, and never searched.
+///
+/// `env.PATH` from SPAWN does NOT drive this. It never has on Windows, and
+/// whether it should is a separate decision. Changing that here would quietly
+/// let the caller's child environment choose what this helper starts.
+///
+/// Pure: the filesystem arrives as two closures, so `--selftest` covers it.
+fn resolve_program(
+    program: &str,
+    search_first: &[String],
+    path_var: Option<&str>,
+    is_file: &dyn Fn(&str) -> bool,
+    full_path: &dyn Fn(&str) -> Option<String>,
+) -> Option<Program> {
+    // Neither can be in a Windows filename. A NUL would also cut the wide string
+    // short and name a different file from the one that was checked.
+    if program.is_empty() || program.contains('"') || program.contains('\0') {
+        return None;
+    }
+    let classify = |candidate: &str| -> Option<Program> {
+        let full = full_path(candidate)?;
+        if !is_file(&full) {
+            return None;
+        }
+        Some(if is_batch(&full) {
+            Program::Batch(full)
+        } else {
+            Program::Image(full)
+        })
+    };
+    let name = with_exe(program);
+    if has_directory_part(program) {
+        return classify(&name);
+    }
+    let from_path = path_var
+        .unwrap_or("")
+        .split(';')
+        .filter(|entry| is_absolute_path_entry(entry));
+    search_first
+        .iter()
+        .map(|dir| dir.as_str())
+        .chain(from_path)
+        .find_map(|dir| {
+            let sep = if dir.ends_with('\\') || dir.ends_with('/') { "" } else { "\\" };
+            classify(&format!("{dir}{sep}{name}"))
+        })
+}
+
+/// The command line for a batch file, with the RESOLVED path as element 0.
+///
+/// A batch file is the one exception to "leave element 0 alone", because Windows
+/// runs it as `cmd.exe /c <this line>` and cmd.exe then looks the name up AGAIN:
+/// its current directory first (the `cwd` option), then the child's PATH. So a
+/// bare name on the line would run a same-named script from the `cwd` option no
+/// matter what was resolved here. Measured, with `lpApplicationName` set and with
+/// it NULL. The script's `%0` therefore becomes the full path; `%~dp0` is what it
+/// was.
+///
+/// Always quoted, whatever the path looks like. A PATH directory may contain
+/// `&` or `(`, which an unquoted path would hand to cmd.exe's parser.
+///
+/// The caller passes NULL as `lpApplicationName` for this. The path is absolute,
+/// so nothing is searched, and Windows wraps the line in the outer quotes cmd.exe
+/// needs only when it parsed the line itself. With `lpApplicationName` set, a
+/// quoted path followed by a quoted argument fails: measured, exit 1, the script
+/// never starts.
+fn batch_command_line(path: &str, argv: &[String], verbatim: bool) -> String {
+    let rest = &argv[1..];
+    let tail = if verbatim {
+        rest.join(" ")
+    } else {
+        windows_command_line(rest)
+    };
+    if rest.is_empty() {
+        format!("\"{path}\"")
+    } else {
+        format!("\"{path}\" {tail}")
+    }
+}
+
+/// Why a name did not resolve, in terms of the thing the caller passed.
+///
+/// Worth the words because node-pty's version of this error is `File not found: `
+/// with NOTHING after the colon, measured by `claude - tynn` on Windows: an error
+/// that names neither the program nor the reason sends the reader looking for a
+/// missing file that is sitting right there.
+///
+/// The `.exe` rule, measured rather than assumed. The first version of this text
+/// asserted that a `.cmd` cannot be spawned directly, and that is FALSE: only
+/// `.exe` is appended, so a bare `cmd` resolves and a bare `npm` does not, because
+/// npm on Windows is `npm.cmd`. With the extension present a `.cmd` runs fine. So
+/// the advice is "pass the extension".
+fn not_found_error(program: &str) -> String {
+    let rule = if std::path::Path::new(program).extension().is_none() {
+        " fancy-pty appends .exe and NOTHING else, so a command that is really a .cmd or .bat (npm, npx, yarn) does not resolve bare: pass the extension (\"npm.cmd\")."
+    } else {
+        ""
+    };
+    if has_directory_part(program) {
+        return format!(
+            "cannot start {program:?} -- file not found. A path with a directory part is relative to the current directory of the process that called open(), not to the cwd option, and is not searched.{rule}"
+        );
+    }
+    let name = with_exe(program);
+    format!(
+        "cannot start {program:?} -- not found on PATH or in the system or Windows directory. The current directory and the helper's own directory are not searched: for a program there, use \".\\{name}\" or an absolute path.{rule}"
+    )
 }
 
 fn main() {
@@ -654,8 +816,7 @@ fn selftest() {
         "verbatim: cmd metacharacters are the caller's",
     );
     expect(same(&["x.exe"], "x.exe"), "verbatim: a bare program");
-    // Element 0 alone stays a program name: with no lpApplicationName,
-    // CreateProcessW would try C:\Program.exe for an unquoted one.
+    // Element 0 alone stays a program name, quoted if it has whitespace.
     expect(
         same(
             &[r"C:\Program Files\x.exe", r#""a b""#],
@@ -688,6 +849,145 @@ fn selftest() {
             r#""C:\Program Files\x.exe" "C:\Program Files\\" next """#,
         ),
         "default: spaces, a trailing backslash and an empty argument are unchanged",
+    );
+
+    // Program resolution. The filesystem is a list; `full` stands in for
+    // GetFullPathNameW with the host's current directory being C:\host.
+    let sys = list(&[r"C:\Windows\System32", r"C:\Windows"]);
+    let full = |p: &str| -> Option<String> {
+        Some(if is_absolute_path_entry(p) {
+            p.to_string()
+        } else {
+            format!(r"C:\host\{}", p.trim_start_matches(r".\").trim_start_matches("./"))
+        })
+    };
+    let resolve = |program: &str, path: Option<&str>, files: &[&str]| -> Option<Program> {
+        resolve_program(
+            program,
+            &sys,
+            path,
+            &|p: &str| files.iter().any(|f| f.eq_ignore_ascii_case(p)),
+            &full,
+        )
+    };
+    let image = |p: &str| Some(Program::Image(p.to_string()));
+    let batch = |p: &str| Some(Program::Batch(p.to_string()));
+
+    expect(
+        resolve("cmd.exe", None, &[r"C:\Windows\System32\cmd.exe"]) == image(r"C:\Windows\System32\cmd.exe"),
+        "resolve: the system directory",
+    );
+    expect(
+        resolve("cmd", None, &[r"C:\Windows\System32\cmd.exe"]) == image(r"C:\Windows\System32\cmd.exe"),
+        "resolve: .exe is appended to a name with no extension",
+    );
+    expect(
+        resolve("x.exe", Some(r"C:\tools"), &[r"C:\Windows\x.exe", r"C:\tools\x.exe"]) == image(r"C:\Windows\x.exe"),
+        "resolve: the Windows directory is ahead of PATH",
+    );
+    expect(
+        resolve("x.exe", Some(r"C:\tools"), &[r"C:\Windows\System32\x.exe", r"C:\Windows\x.exe"])
+            == image(r"C:\Windows\System32\x.exe"),
+        "resolve: the system directory is ahead of the Windows directory",
+    );
+    expect(
+        resolve("x.exe", Some(r"C:\a;C:\b"), &[r"C:\a\x.exe", r"C:\b\x.exe"]) == image(r"C:\a\x.exe"),
+        "resolve: PATH entries are tried in order",
+    );
+    expect(
+        resolve("x.exe", Some(r"C:\a\"), &[r"C:\a\x.exe"]) == image(r"C:\a\x.exe"),
+        "resolve: an entry's trailing backslash is not doubled",
+    );
+    expect(
+        resolve("powershell.exe", Some(r"C:\Windows\System32\WindowsPowerShell\v1.0"), &[
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ]) == image(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        "resolve: powershell is found through PATH",
+    );
+    expect(
+        resolve("bash.exe", None, &[r"C:\host\bash.exe"]) == None,
+        "resolve: a file in the current directory is not found by a bare name",
+    );
+    for skipped in [".", "", "sub", r"..\up", r"\rooted", "C:drive", "\"C:\\host\"", "%SystemRoot%", " C:\\host"] {
+        expect(
+            resolve("x.exe", Some(skipped), &[r"C:\host\x.exe", r"C:\host\.\x.exe", r"C:\host\sub\x.exe"]) == None,
+            &format!("resolve: PATH entry {skipped:?} is skipped"),
+        );
+    }
+    expect(
+        resolve("x.exe", Some(r".;;sub;\\server\share"), &[r"\\server\share\x.exe"]) == image(r"\\server\share\x.exe"),
+        "resolve: relative entries are skipped without ending the search, and UNC counts",
+    );
+    expect(
+        resolve("x.exe", Some("C:/a"), &[r"C:/a\x.exe"]) == image(r"C:/a\x.exe"),
+        "resolve: an entry with forward slashes is absolute",
+    );
+    expect(
+        resolve(r".\tool.exe", Some(r"C:\a"), &[r"C:\host\tool.exe", r"C:\a\tool.exe"]) == image(r"C:\host\tool.exe"),
+        "resolve: a directory part is relative to the host cwd",
+    );
+    expect(
+        resolve("./tool", None, &[r"C:\host\tool.exe"]) == image(r"C:\host\tool.exe"),
+        "resolve: forward slash too, with .exe appended",
+    );
+    expect(
+        resolve(r"sub\tool.exe", Some(r"C:\a"), &[r"C:\a\sub\tool.exe"]) == None,
+        "resolve: a directory part is not searched",
+    );
+    expect(
+        resolve(r"C:\dir.v2\tool", None, &[r"C:\dir.v2\tool.exe"]) == image(r"C:\dir.v2\tool.exe"),
+        "resolve: only the LAST component decides whether there is an extension",
+    );
+    expect(
+        resolve(r"C:\dir\hello", None, &[r"C:\dir\hello"]) == None,
+        "resolve: a file with no extension is not run (.exe is what gets tried)",
+    );
+    expect(
+        resolve("npm", Some(r"C:\n"), &[r"C:\n\npm.cmd"]) == None,
+        "resolve: .exe is the only thing appended, so a bare npm is not npm.cmd",
+    );
+    expect(
+        resolve("npm.cmd", Some(r"C:\n"), &[r"C:\n\npm.cmd"]) == batch(r"C:\n\npm.cmd"),
+        "resolve: a bare .cmd on PATH is a batch file",
+    );
+    expect(
+        resolve(r".\X.BAT", None, &[r"C:\host\X.BAT"]) == batch(r"C:\host\X.BAT"),
+        "resolve: .BAT is a batch file in any case, and made absolute",
+    );
+    expect(resolve("", Some(r"C:\a"), &[r"C:\a\.exe"]) == None, "resolve: an empty name finds nothing");
+    expect(
+        resolve("x.exe\0y", Some(r"C:\a"), &[r"C:\a\x.exe"]) == None,
+        "resolve: a NUL cannot quietly name a different file",
+    );
+    expect(
+        resolve("\"x.exe\"", Some(r"C:\a"), &[r"C:\a\x.exe"]) == None,
+        "resolve: a quote is not a filename",
+    );
+
+    let n = list(&["npm.cmd", "a b", "c"]);
+    expect(
+        batch_command_line(r"C:\n\npm.cmd", &n, false) == r#""C:\n\npm.cmd" "a b" c"#,
+        "batch: the resolved path replaces element 0, always quoted",
+    );
+    expect(
+        batch_command_line(r"C:\R&D\x.cmd", &list(&["x.cmd", r#""a b""#, "c"]), true) == r#""C:\R&D\x.cmd" "a b" c"#,
+        "batch: verbatim leaves the rest raw, and & in the path stays inside quotes",
+    );
+    expect(
+        batch_command_line(r"C:\n\npm.cmd", &list(&["npm.cmd"]), false) == r#""C:\n\npm.cmd""#,
+        "batch: no arguments, no trailing space",
+    );
+
+    let bare = not_found_error("tool.exe");
+    expect(bare.contains("\"tool.exe\""), "not found: names the program");
+    expect(bare.contains("not found on PATH"), "not found: says where it looked");
+    expect(bare.contains(r".\tool.exe"), "not found: says how to ask for the current directory");
+    expect(!bare.contains("appends"), "not found: an extension does not get the .exe rule");
+    expect(not_found_error("npm").contains("appends .exe and NOTHING else"), "not found: no extension does");
+    expect(not_found_error("npm").contains(r".\npm.exe"), "not found: and the hint names what would be tried");
+    expect(
+        not_found_error(r".\tool.exe").contains("not to the cwd option"),
+        "not found: a directory part gets its own rule",
     );
 
     // Lifetime: the state machine the three threads share.
@@ -895,6 +1195,51 @@ mod win {
         fn TerminateProcess(h: Handle, code: u32) -> i32;
         fn ResumeThread(h: Handle) -> u32;
         fn SetConsoleCtrlHandler(handler: *const c_void, add: i32) -> i32;
+        fn GetSystemDirectoryW(buf: *mut u16, size: u32) -> u32;
+        fn GetWindowsDirectoryW(buf: *mut u16, size: u32) -> u32;
+        fn GetFileAttributesW(path: *const u16) -> u32;
+        fn GetFullPathNameW(path: *const u16, size: u32, buf: *mut u16, file: *mut *mut u16) -> u32;
+    }
+
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+    /// Where a bare name is looked up before PATH, with the directory that
+    /// cannot be read left out rather than guessed at.
+    fn search_first() -> Vec<String> {
+        let mut dirs = Vec::new();
+        let getters: [unsafe extern "system" fn(*mut u16, u32) -> u32; 2] =
+            [GetSystemDirectoryW, GetWindowsDirectoryW];
+        for get in getters {
+            let mut buf = vec![0u16; 1024];
+            let n = unsafe { get(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            if n > 0 && n < buf.len() {
+                dirs.push(String::from_utf16_lossy(&buf[..n]));
+            }
+        }
+        dirs
+    }
+
+    fn is_file(path: &str) -> bool {
+        let attrs = unsafe { GetFileAttributesW(wide(path).as_ptr()) };
+        attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_DIRECTORY == 0
+    }
+
+    /// Absolute, against this process's current directory, which is the host's.
+    fn full_path(path: &str) -> Option<String> {
+        let path = wide(path);
+        unsafe {
+            let need = GetFullPathNameW(path.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut());
+            if need == 0 {
+                return None;
+            }
+            let mut buf = vec![0u16; need as usize];
+            let n = GetFullPathNameW(path.as_ptr(), need, buf.as_mut_ptr(), std::ptr::null_mut());
+            if n == 0 || n >= need {
+                return None;
+            }
+            Some(String::from_utf16_lossy(&buf[..n as usize]))
+        }
     }
 
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
@@ -976,39 +1321,12 @@ mod win {
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const ERROR_ACCESS_DENIED: u32 = 5;
 
-    /// Explain a failed spawn in terms of the thing the caller passed.
-    ///
-    /// `CreateProcessW failed (GetLastError=2)` is accurate and tells a
-    /// consumer nothing. Worth the words because node-pty's version of this
-    /// error is `File not found: ` with NOTHING after the colon (the wide
-    /// string prints empty), measured by `claude - tynn` on Windows the same
-    /// day: an error that names neither the program nor the reason sends the
-    /// reader looking for a missing file that is sitting right there.
-    ///
-    /// THE RULE, measured rather than assumed -- the first version of this
-    /// function asserted that a `.cmd` cannot be spawned directly, and that is
-    /// FALSE. What is true:
-    ///
-    ///   * `CreateProcessW` appends `.exe` and NOTHING else. So a bare `cmd`
-    ///     resolves and a bare `npm` does not, because npm on Windows is
-    ///     `npm.cmd`.
-    ///   * With the extension present, a `.cmd` / `.bat` runs fine -- Windows
-    ///     invokes it through the command processor itself. `hello.cmd` works;
-    ///     `hello` does not.
-    ///
-    /// So the advice is just "pass the extension", which is both simpler and
-    /// correct. The wrong version would have sent a consumer to wrap every
-    /// script in `cmd.exe /c` for no reason.
+    /// A name that resolved and then failed to start. A name that did not
+    /// resolve never gets this far: see `not_found_error`.
     fn spawn_error(program: &str) -> String {
         let code = unsafe { GetLastError() };
         let hint = match code {
-            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
-                if std::path::Path::new(program).extension().is_none() {
-                    " -- not found on PATH. CreateProcessW appends .exe and NOTHING else,                      so a command that is really a .cmd or .bat (npm, npx, yarn) does not                      resolve bare: pass the extension (\"npm.cmd\"), or run it through a                      shell (argv: [\"cmd.exe\", \"/c\", \"npm\", ...])"
-                } else {
-                    " -- not found on PATH"
-                }
-            }
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => " -- file not found",
             ERROR_ACCESS_DENIED => " -- access denied",
             _ => "",
         };
@@ -1031,6 +1349,22 @@ mod win {
     pub fn run(req: SpawnRequest, out: Arc<Out>, control: std::io::Stdin) -> Result<u32, String> {
         // First, so a refused request has created nothing.
         let command = command_line(&req.argv, req.windows_verbatim)?;
+        let path_var = std::env::var_os("PATH").map(|p| p.to_string_lossy().into_owned());
+        let resolved = resolve_program(
+            &req.argv[0],
+            &search_first(),
+            path_var.as_deref(),
+            &is_file,
+            &full_path,
+        )
+        .ok_or_else(|| not_found_error(&req.argv[0]))?;
+        // An image is named outright, so Windows does no search of its own. A
+        // batch file passes NULL, and its absolute path on the line means there
+        // is nothing to search for: see `batch_command_line`.
+        let (application, command) = match resolved {
+            Program::Image(path) => (Some(wide(&path)), command),
+            Program::Batch(path) => (None, batch_command_line(&path, &req.argv, req.windows_verbatim)),
+        };
         unsafe {
             // RE-ENABLE Ctrl-C before creating the command, or F4's graceful
             // kill cannot work. The JS side spawns this helper detached, and
@@ -1153,7 +1487,7 @@ mod win {
             }
 
             let created = CreateProcessW(
-                std::ptr::null(),
+                application.as_ref().map(|a| a.as_ptr()).unwrap_or(std::ptr::null()),
                 cmdline.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),

@@ -8,6 +8,40 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+### Security
+
+- **Windows: a bare program name now only ever means the installed program.**
+  Before this, a name with no directory part, such as `cmd.exe` or `powershell.exe`,
+  could start a same-named file from the host's current directory, from the
+  helper's own directory, or through a relative or empty `PATH` entry. A bare
+  `.cmd` or `.bat` could also start a same-named script from the `cwd` option or
+  from the `env` option's `PATH`. This protects any app that opens a terminal
+  while its current directory, or its `cwd` option, is a folder it does not fully
+  control. On 0.3.0 and earlier, upgrade.
+
+  The helper now resolves the program itself: the system directory, the Windows
+  directory, then absolute `PATH` entries from the environment of the process
+  that called `open()`, with `.exe` appended if there is no extension. Linux and
+  macOS are unchanged.
+
+  **BREAKING, for a few callers.** A bare name that relied on being in the host's
+  current directory or beside the helper no longer resolves, and neither does
+  one that relied on a relative `PATH` entry: use `.\tool.exe` or an absolute
+  path. A relative path with a directory part (`sub\tool.exe`) now means the
+  host's current directory only, where it used to be searched for along `PATH`
+  too. If you start programs from the system, or by a name on an absolute `PATH`
+  entry, or by a full path, do nothing.
+
+### Changed
+
+- A `.cmd` or `.bat` started by a bare or relative name now sees its full path as
+  `%0`. `%~dp0` and the script's arguments are as they were. Start one by an
+  absolute path and only the quoting of `%0` can differ. Any other program's
+  command line is unchanged, including `argv[0]`.
+- The not-found error now states the search rule and how to ask for a program in
+  the current directory. It no longer suggests `cmd.exe /c npm`, whose lookup
+  starts in the shell's current directory.
+
 ## [0.3.0] - 2026-11-02
 
 ### Added
