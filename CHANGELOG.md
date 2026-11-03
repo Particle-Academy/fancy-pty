@@ -34,6 +34,16 @@ version number is not a stability promise until 1.0; read the entry.
   and a spawn without it sends the same bytes and produces the same command line
   as before.
 
+### Fixed
+
+- **`open()` no longer leaves a helper running when it refuses the request.** The
+  request was encoded after the helper had started, so `open({ argv: [] })` threw
+  with no `Pty` to kill and a helper blocked until the calling process exited. It
+  is now checked first. The same exception is thrown, except that a bad request
+  now reports itself even when the helper binary is also missing.
+
+  **What you must DO:** nothing.
+
 ## [0.2.1] - 2026-11-02
 
 ### Fixed

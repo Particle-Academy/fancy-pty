@@ -97,6 +97,11 @@ export interface PtyOptions extends SpawnRequest {
  * output — the same contract `node-pty` has, so nothing downstream changes.
  */
 export function open(options: PtyOptions): Pty {
+    // First, so a request it refuses has started nothing. Encoding after the
+    // spawn threw with a helper left blocked on its first frame, and no `Pty`
+    // for the caller to kill it with.
+    const spawnFrame = frame(Request.Spawn, encodeSpawn(options));
+
     const exe = options.helper ?? helperPath();
 
     if (!options.helper && !isSupported()) {
@@ -403,7 +408,7 @@ export function open(options: PtyOptions): Pty {
         return true;
     };
 
-    send(frame(Request.Spawn, encodeSpawn(options)));
+    send(spawnFrame);
 
     return {
         get pid() {
