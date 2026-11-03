@@ -8,6 +8,8 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-02
+
 ### Security
 
 - **Windows: a bare program name now only ever means the installed program.**
