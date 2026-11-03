@@ -571,6 +571,20 @@ if (!isWindows) {
     ok(flagged.code === 0 && flagged.errors.length === 0, `with exit 0 and no error (${flagged.code})`);
 }
 
+// ------------------------------------------------------- 6f. no environment
+console.log("\n6f. a pty with no environment variables at all still starts");
+{
+    const exitSeven = isWindows ? ["cmd.exe", "/d", "/c", "exit 7"] : ["/bin/sh", "-c", "exit 7"];
+    for (const [label, options] of [
+        ["env: {}", { env: {} }],
+        ["no env option", {}],
+    ]) {
+        const c = collect(open({ argv: exitSeven, ...options }));
+        const code = await withTimeout(c.exit, 15000);
+        ok(code === 7 && c.errors.length === 0, `${label}: exit 7, no error (${code}${c.errors.length ? `, ${c.errors[0].message}` : ""})`);
+    }
+}
+
 // --------------------------------------------------------- 7. THE BAR
 console.log("\n7. THE BAR: spawn/exit cycles must retain nothing");
 {

@@ -425,6 +425,34 @@ fn command_line(argv: &[String], verbatim: bool) -> Result<String, String> {
     Ok(out)
 }
 
+// ------------------------------------------------- Windows environment block
+
+/// A UTF-16 environment block: `K=V\0K=V\0\0`.
+///
+/// Passed explicitly rather than inherited, so a pty's environment is exactly
+/// what the caller asked for. A helper that silently merged its own would make
+/// terminal behaviour depend on how the APP was launched, which is invisible from
+/// the consumer's side and impossible to reproduce.
+///
+/// The block always ends in two NULs: one ending the last string and one ending
+/// the list. So an EMPTY block is two NULs as well, not one. A single NUL is
+/// refused by `CreateProcessW` with `GetLastError=87`, measured on every release
+/// before this was fixed, which is what `env: {}` and a missing `env` both sent.
+fn env_block(env: &[(String, String)]) -> Vec<u16> {
+    let mut b: Vec<u16> = Vec::new();
+    for (k, v) in env {
+        b.extend(k.encode_utf16());
+        b.push('=' as u16);
+        b.extend(v.encode_utf16());
+        b.push(0);
+    }
+    if b.is_empty() {
+        b.push(0);
+    }
+    b.push(0);
+    b
+}
+
 // ------------------------------------------------- Windows program resolution
 
 /// What to start, once a name has been resolved.
@@ -988,6 +1016,12 @@ fn selftest() {
     expect(
         not_found_error(r".\tool.exe").contains("not to the cwd option"),
         "not found: a directory part gets its own rule",
+    );
+
+    expect(env_block(&[]) == [0u16, 0], "env block: an empty one is two NULs");
+    expect(
+        env_block(&[("A".to_string(), "1".to_string())]) == ['A' as u16, '=' as u16, '1' as u16, 0, 0],
+        "env block: one variable ends in two NULs, no more",
     );
 
     // Lifetime: the state machine the three threads share.
@@ -1694,25 +1728,6 @@ mod win {
         }
     }
 
-    /// A UTF-16 environment block: `K=V\0K=V\0\0`.
-    ///
-    /// Passed explicitly rather than inherited, so a pty's environment is
-    /// exactly what the caller asked for. A helper that silently merged its own
-    /// would make terminal behaviour depend on how the APP was launched, which
-    /// is invisible from the consumer's side and impossible to reproduce.
-    fn env_block(env: &[(String, String)]) -> Vec<u16> {
-        let mut b: Vec<u16> = Vec::new();
-        for (k, v) in env {
-            b.extend(k.encode_utf16());
-            b.push('=' as u16);
-            b.extend(v.encode_utf16());
-            b.push(0);
-        }
-        // The block terminator. With no variables at all this leaves a single
-        // NUL, which is the empty-block form CreateProcessW expects.
-        b.push(0);
-        b
-    }
 }
 
 #[cfg(windows)]

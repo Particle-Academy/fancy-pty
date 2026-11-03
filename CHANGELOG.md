@@ -8,6 +8,15 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: a pty with no environment variables now starts.** `env: {}`, and
+  leaving `env` out, failed with `CreateProcessW GetLastError=87` on every release,
+  because the helper sent one NUL where an empty environment block needs two. The
+  child gets an empty environment, as asked: the helper's own variables are still
+  not merged in, so most programs want at least `SystemRoot` and `PATH` from you.
+  Nothing to do if you already pass `env`.
+
 ## [0.4.0] - 2026-11-02
 
 ### Security

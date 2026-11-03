@@ -162,7 +162,7 @@ try {
         helperEnv.PATH = o.helperPathVar ?? pathOf();
         if (o.helperVarSet) helperEnv[VAR] = "1";
         if (o.helperPathVar === null) delete helperEnv.PATH;
-        const childEnv = { ...baseEnv(), PATH: o.childPathVar ?? pathOf(onPath), FANCY_PTY_ECHO_OUT: out };
+        const childEnv = o.childEnvExact ?? { ...baseEnv(), PATH: o.childPathVar ?? pathOf(onPath), FANCY_PTY_ECHO_OUT: out };
 
         const child = spawn(o.helper ?? helperPlain, [], {
             stdio: ["pipe", "pipe", "pipe"],
@@ -445,6 +445,29 @@ try {
         ok(missingAbs.errors.join("; ").includes("gone.exe"), "and it names the program");
         expectMissing(await go({ argv: [""] }), "an empty program name");
     }
+
+    // ------------------------------------------------------- an empty environment
+    // A block with no variables must still end in two NULs. One was
+    // CreateProcessW GetLastError=87 on every release before this check.
+    console.log("\n--- an empty environment ---");
+    const realCmdExit = ["cmd.exe", "/d", "/c", "exit 7"];
+    const withOne = await run({ argv: realCmdExit, childEnvExact: { FPL_SENTINEL: "1" } });
+    ok(withOne.code === 7 && withOne.errors.length === 0, `control: one variable, cmd.exe starts and exits 7 (${withOne.code}, ${withOne.errors.join("; ").slice(0, 70)})`);
+    const noVars = await run({ argv: realCmdExit, childEnvExact: {} });
+    ok(noVars.pid !== null && noVars.errors.length === 0, `env {}: the command starts (${noVars.errors.join("; ").slice(0, 70) || `pid ${noVars.pid}`})`);
+    ok(noVars.code === 7, `env {}: and its exit code comes back (${noVars.code})`);
+    // The helper's own variable is what a merge would leak, so this is the check
+    // that "empty" still means the caller's empty rather than the helper's.
+    process.env.FPL_HELPER_ONLY = "leaked";
+    const shownOne = await run({ argv: ["cmd.exe", "/d", "/c", "set"], childEnvExact: { FPL_SENTINEL: "shown" } });
+    const shownNone = await run({ argv: ["cmd.exe", "/d", "/c", "set"], childEnvExact: {} });
+    delete process.env.FPL_HELPER_ONLY;
+    ok(/FPL_SENTINEL=shown/.test(shownOne.text), "control: `set` shows what the child was given");
+    ok(shownNone.code === 0 && !/FPL_/.test(shownNone.text), `env {}: the child sees none of the helper's variables (exit ${shownNone.code})`);
+    const noVarsBatch = path.join(onPath, "fplnovars.cmd");
+    writeFileSync(noVarsBatch, "@exit /b 5\r\n");
+    const batchNoVars = await run({ argv: [noVarsBatch], childEnvExact: {} });
+    ok(batchNoVars.code === 5 && batchNoVars.errors.length === 0, `env {}: a .cmd starts too (exit ${batchNoVars.code}, ${batchNoVars.errors.join("; ").slice(0, 70)})`);
 
     console.log(failures === 0 ? `\nALL GREEN (${total})\n` : `\n${failures} of ${total} CHECK(S) FAILED\n`);
 } finally {
