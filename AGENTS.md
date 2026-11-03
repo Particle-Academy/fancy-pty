@@ -184,6 +184,12 @@ it did**: agent shells on the dev machine set it, and with it set the cwd case i
 green on the vulnerable code. `FANCY_PTY_LOOKUP_HELPER=<exe>` runs it against
 another build.
 
+**Its driver kills only a shell held open on purpose (`/k`, `-NoExit`).** A kill
+sent on the PID frame lands while a batch file is still starting, and that looks
+exactly like a batch file that cannot start: no output, exit 1. It was a tie on
+the dev machine (query about 25 ms, batch about 30 ms) and lost on a CI runner.
+Check `7a` uses a script that takes a second, so this goes red on any machine.
+
 ## Testing
 
 ```

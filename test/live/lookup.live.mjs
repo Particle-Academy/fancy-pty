@@ -58,7 +58,10 @@ const helperUnderTest = process.env.FANCY_PTY_LOOKUP_HELPER || helperPath();
 const q = '"';
 
 console.log(`\nfancy-pty lookup suite -- helper under test: ${helperUnderTest}`);
-console.log(`ambient ${VAR} = ${JSON.stringify(process.env[VAR] ?? null)} (removed per case below)\n`);
+console.log(`ambient ${VAR} = ${JSON.stringify(process.env[VAR] ?? null)} (removed from this whole process tree)\n`);
+// Everything below inherits this, so a dev machine that sets the variable runs in
+// the same condition as a runner that does not. Also covered per case by baseEnv.
+for (const k of Object.keys(process.env)) if (k.toLowerCase() === VAR.toLowerCase()) delete process.env[k];
 
 const sameFile = (a, b) => typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
 const isAbsoluteEntry = (e) => /^[A-Za-z]:[\\/]/.test(e) || /^[\\/]{2}/.test(e);
@@ -127,6 +130,12 @@ try {
     // not come from.
     writeFileSync(path.join(onPath, "fplbatch.cmd"), batchBody("GOOD-PATH", 7));
     writeFileSync(path.join(spacedPath, "fplspaced.cmd"), batchBody("GOOD-SPACED"));
+    // Takes about a second before it does anything. A script's speed must not
+    // decide the verdict, and a fast machine hides it if it does: see check 7a.
+    writeFileSync(
+        path.join(onPath, "fplslow.cmd"),
+        batchBody("GOOD-SLOW", 7).replace("@echo off\r\n", "@echo off\r\n%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul\r\n"),
+    );
     writeFileSync(path.join(hostPlants, "fplbatch.cmd"), batchBody("PLANT-HOST"));
     writeFileSync(path.join(beside, "fplbatch.cmd"), batchBody("PLANT-BESIDE"));
     writeFileSync(path.join(optionPlants, "fplbatch.cmd"), batchBody("PLANT-OPTION"));
@@ -163,6 +172,7 @@ try {
             env: helperEnv,
         });
         const result = { pid: null, image: null, errors: [], code: undefined, text: "" };
+        const heldOpen = o.argv.some((a) => a === "/k" || a === "-NoExit");
         const dec = new FrameDecoder();
         child.stdin.on("error", () => {});
         child.stderr.on("data", () => {});
@@ -174,8 +184,11 @@ try {
                     result.pid = f.payload.readUInt32LE(0);
                     // Asked before anything else, while the command still lives.
                     result.image = imageOf(result.pid);
-                    // Long-lived real shells are ended here. A plant has exited.
-                    child.stdin.write(frame(T_KILL, Buffer.alloc(0)));
+                    // ONLY a shell held open on purpose is ended here. Anything
+                    // else gets to finish: a kill at this point lands while a
+                    // batch file is still starting, and it dies with exit 1 and
+                    // no output, which reads exactly like one that cannot start.
+                    if (heldOpen) child.stdin.write(frame(T_KILL, Buffer.alloc(0)));
                 } else if (f.kind === F_EXIT) result.code = f.payload.readUInt32LE(0);
                 else if (f.kind === F_ERROR) result.errors.push(f.payload.toString("utf8"));
                 else if (f.kind === F_DATA) result.text += f.payload.toString("utf8");
@@ -201,6 +214,7 @@ try {
         }, 20000);
         await exited;
         clearTimeout(timer);
+        if (result.timeout) ok(false, `${JSON.stringify(o.argv)} was still running after 20 s and was ended`);
 
         result.records = existsSync(out)
             ? readFileSync(out, "utf8")
@@ -358,6 +372,15 @@ try {
         ok(batchWas(abs, "GOOD-PATH"), `an absolute .cmd runs (${abs.batch[0] ?? abs.errors.join("; ")})`);
         ok(abs.code === 7, `and its exit code comes back (${abs.code})`);
         ok(abs.records.length === 0, "with the real command processor");
+
+        // 7a. Nothing here may end a command that is still working. This suite's
+        // own driver once did, and a script ran only if it beat that: 30 checks
+        // red on a CI runner, green here, with the product fine on both.
+        const slowAbs = await go({ argv: [path.join(onPath, "fplslow.cmd"), "x"] });
+        ok(batchWas(slowAbs, "GOOD-SLOW"), `a .cmd that takes a second still finishes (${slowAbs.batch[0] ?? slowAbs.errors.join("; ")})`);
+        ok(slowAbs.code === 7, `and its exit code comes back (${slowAbs.code})`);
+        const slowBare = await go({ argv: ["fplslow.cmd", "x"], helperPathVar: pathOf(onPath) });
+        ok(batchWas(slowBare, "GOOD-SLOW") && slowBare.code === 7, `so does a bare one (${slowBare.batch[0] ?? slowBare.errors.join("; ")}, exit ${slowBare.code})`);
 
         const line = verbatim ? [`${q}a b${q}`, "c"] : ["a b", "c"];
         const spacedAbs = await go({ argv: [spacedBatch, ...line] });
