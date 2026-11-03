@@ -8,6 +8,8 @@ version number is not a stability promise until 1.0; read the entry.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-02
+
 ### Security
 
 - **A `.cmd` or `.bat` is refused if an argument contains a character `cmd.exe` acts
