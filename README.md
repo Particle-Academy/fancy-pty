@@ -26,6 +26,13 @@ no way to report:
 | `onData(cb)` · `onExit(cb)` | its output and its end |
 | `onError(cb)` | spawn failures, protocol faults, a helper that died |
 
+<!-- fancy-agents-note:start -->
+> **For agents.** This package is listed on the Fancy MCP catalog server at
+> `https://ui.particle.academy/mcp` (streamable HTTP, no API key; MCP id `fancy-ui`),
+> with install commands and docs, alongside the rest of the kit. How an agent
+> installs and uses this package is in [AGENTS.md](https://github.com/Particle-Academy/fancy-pty/blob/main/AGENTS.md).
+<!-- fancy-agents-note:end -->
+
 ## Which program a name starts on Windows
 
 A name with no directory part, like `cmd.exe` above, is looked up in this order,
@@ -247,30 +254,6 @@ per live pty inside the host and retains one of them per exited pty.
 
 This is **not** a terminal emulator. It moves bytes and owns process lifetime;
 rendering belongs to [`fancy-term`](https://github.com/Particle-Academy/fancy-term).
-
-## Tests
-
-```
-npm test             # the pure protocol — fast, hermetic
-npm run build:helper # rustc, then the helper's own --selftest
-npm run verify:pty   # LIVE: real shells, resize, kill, and the leak bar
-```
-
-`verify:pty` asserts the numbers the incident set, per exited pty: **≤ 0.1
-threads, ≤ 1.0 handles, ≤ 0.5 MB** — thresholds chosen so the 2026-10-06 figures
-fail by 10× and a tidy engine passes with headroom. It opens with a *positive
-control* (hold 20 ptys, confirm the gauges rise), because a leak check that has
-never seen its gauges move cannot go red.
-
-## Building the helper
-
-`rustc` and nothing else. No `Cargo.toml`, no crates — Rust std with
-hand-written `extern "system"` declarations.
-
-```
-npm run build:helper                                   # host
-node scripts/build-helper.mjs --target win32-arm64     # cross (needs rustup target add)
-```
 
 ## Licence
 
